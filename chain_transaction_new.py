@@ -203,15 +203,27 @@ def _collect_descendants(
 
 def _add_filtered_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    添加4个过滤列（优化版本，避免使用 iterrows）
+    添加 6 个过滤列（优化版本，避免使用 iterrows）
     1. 按 global_id 过滤候选子节点
     2. 按 global_id 过滤候选父节点
     3. 按 msgType 过滤候选子节点
     4. 按 msgType 过滤候选父节点
+    5. 按 ESB/F5 结构 + msgType 规则过滤候选子节点
+    6. 按 ESB/F5 结构 + msgType 规则过滤候选父节点
     
-    过滤规则：
+    基本过滤规则：
     - global_id 过滤：当子节点和父节点的 global_id 都存在且不相同时，剔除
-    - msgType 过滤：如果候选节点多于1个，保留 msgType 相同的
+    - msgType 过滤：如果候选节点多于 1 个，保留 msgType 相同的
+    
+    ESB/F5 额外规则（父子必须同 msgType）：
+    1) 当前数据：srcSysname = ESB-F5, dstSysname = ESB
+       某候选父节点：srcSysname = XXX, dstSysname = ESB-F5
+    2) 当前数据：srcSysname = ESB,    dstSysname = XXX-F5
+       某候选父节点：srcSysname = ESB-F5, dstSysname = ESB
+    3) 当前数据：srcSysname = XXX-F5, dstSysname = XXX
+       某候选父节点：srcSysname = ESB, dstSysname = XXX-F5
+    对应的候选子节点过滤规则类似。
+    在以上 3 种结构下，如果父子 msgType 不一致，则剔除该父/子节点。
     """
     # 检查必需列
     has_global_id = 'global_id' in df.columns
@@ -220,11 +232,18 @@ def _add_filtered_columns(df: pd.DataFrame) -> pd.DataFrame:
     # 创建快速查找字典（避免 iterrows）
     index_to_gid = {}
     index_to_msg = {}
+    index_to_src = {}
+    index_to_dst = {}
     
     if has_global_id:
         index_to_gid = dict(zip(df['index'].values, df['global_id'].values))
     if has_msg_type:
         index_to_msg = dict(zip(df['index'].values, df['msgType'].values))
+    # 系统名映射
+    if 'srcSysname' in df.columns:
+        index_to_src = dict(zip(df['index'].values, df['srcSysname'].values))
+    if 'dstSysname' in df.columns:
+        index_to_dst = dict(zip(df['index'].values, df['dstSysname'].values))
     
     # 使用 numpy 数组提高性能
     indices = df['index'].values
@@ -240,11 +259,49 @@ def _add_filtered_columns(df: pd.DataFrame) -> pd.DataFrame:
     parents_filtered_by_gid = []
     children_filtered_by_msg = []
     parents_filtered_by_msg = []
+    children_filtered_by_esb_msg = []
+    parents_filtered_by_esb_msg = []
+    # 交集：同时满足 gid 过滤和 esb_msg 过滤
+    children_filtered_by_gid_esb = []
+    parents_filtered_by_gid_esb = []
+
+    def _esb_requires_same_msg(parent_idx: int, child_idx: int) -> bool:
+        """
+        判断在 ESB/F5 结构下，父子是否必须 msgType 一致。
+        parent_idx: 父节点 index
+        child_idx:  子节点 index
+        """
+        if not index_to_src or not index_to_dst:
+            return False
+        
+        p_src = str(index_to_src.get(parent_idx, '') or '')
+        p_dst = str(index_to_dst.get(parent_idx, '') or '')
+        c_src = str(index_to_src.get(child_idx, '') or '')
+        c_dst = str(index_to_dst.get(child_idx, '') or '')
+        
+        # 1) child: ESB-F5 -> ESB, parent: XXX -> ESB-F5
+        cond1 = (c_src == 'ESB-F5' and c_dst == 'ESB' and p_dst == 'ESB-F5')
+        
+        # 2) child: ESB -> XXX-F5, parent: ESB-F5 -> ESB
+        cond2 = (c_src == 'ESB' and c_dst.endswith('-F5') and
+                 p_src == 'ESB-F5' and p_dst == 'ESB')
+        
+        # 3) child: XXX-F5 -> XXX, parent: ESB -> XXX-F5
+        #    这里要求 child.dst 去掉 -F5 后与前缀一致
+        if c_src.endswith('-F5'):
+            prefix = c_src[:-3]
+        else:
+            prefix = ''
+        cond3 = (c_src.endswith('-F5') and c_dst == prefix and
+                 p_src == 'ESB' and p_dst == c_src)
+        
+        return cond1 or cond2 or cond3
     
     # 优化后的循环：直接使用数组索引
     for i in range(n):
         current_gid = gids[i] if has_global_id else None
         current_msg = msgs[i] if has_msg_type else None
+        current_index = indices[i]
         children = children_list[i]
         parents = parents_list[i]
         
@@ -292,17 +349,70 @@ def _add_filtered_columns(df: pd.DataFrame) -> pd.DataFrame:
         else:
             parents_msg_filtered = parents_gid_filtered
         
+        # === 5. ESB/F5 结构下强制 msgType 一致 - 过滤父节点 ===
+        # 注意：这里要求在「候选父节点」基础上进行过滤，而不是在 msg/gid 已过滤结果上再过滤
+        if has_msg_type and parents:
+            parents_esb_filtered = []
+            for parent_idx in parents:
+                # 如果满足 ESB/F5 结构，并且 msgType 不一致，则剔除
+                if _esb_requires_same_msg(parent_idx, current_index):
+                    parent_msg = index_to_msg.get(parent_idx, None)
+                    if pd.isna(parent_msg) or pd.isna(current_msg) or parent_msg != current_msg:
+                        continue
+                parents_esb_filtered.append(parent_idx)
+        else:
+            parents_esb_filtered = list(parents)
+        
+        # === 6. ESB/F5 结构下强制 msgType 一致 - 过滤子节点 ===
+        # 同理，在「候选子节点」基础上进行过滤
+        if has_msg_type and children:
+            children_esb_filtered = []
+            for child_idx in children:
+                # 当前行为父节点，child_idx 为子节点
+                if _esb_requires_same_msg(current_index, child_idx):
+                    child_msg = index_to_msg.get(child_idx, None)
+                    if pd.isna(child_msg) or pd.isna(current_msg) or child_msg != current_msg:
+                        continue
+                children_esb_filtered.append(child_idx)
+        else:
+            children_esb_filtered = list(children)
+        
         # 添加到结果列表
         children_filtered_by_gid.append(children_gid_filtered)
         parents_filtered_by_gid.append(parents_gid_filtered)
         children_filtered_by_msg.append(children_msg_filtered)
         parents_filtered_by_msg.append(parents_msg_filtered)
+        children_filtered_by_esb_msg.append(children_esb_filtered)
+        parents_filtered_by_esb_msg.append(parents_esb_filtered)
+
+        # === 7. gid 过滤 & esb_msg 过滤的交集 ===
+        # 转为集合再转回有序列表（保持原 gid 过滤顺序）
+        if children_gid_filtered and children_esb_filtered:
+            esb_set = set(children_esb_filtered)
+            children_gid_esb = [idx for idx in children_gid_filtered if idx in esb_set]
+        else:
+            children_gid_esb = []
+
+        if parents_gid_filtered and parents_esb_filtered:
+            esb_set_p = set(parents_esb_filtered)
+            parents_gid_esb = [idx for idx in parents_gid_filtered if idx in esb_set_p]
+        else:
+            parents_gid_esb = []
+
+        children_filtered_by_gid_esb.append(children_gid_esb)
+        parents_filtered_by_gid_esb.append(parents_gid_esb)
     
     # 添加新列
     df['候选子节点_gid过滤'] = children_filtered_by_gid
     df['候选父节点_gid过滤'] = parents_filtered_by_gid
     df['候选子节点_msg过滤'] = children_filtered_by_msg
     df['候选父节点_msg过滤'] = parents_filtered_by_msg
+    # ESB/F5 结构 + msgType 规则过滤结果
+    df['候选子节点_esb_msg过滤'] = children_filtered_by_esb_msg
+    df['候选父节点_esb_msg过滤'] = parents_filtered_by_esb_msg
+    # 同时满足 gid 和 esb_msg 两种过滤条件
+    df['候选子节点_gid_esb过滤'] = children_filtered_by_gid_esb
+    df['候选父节点_gid_esb过滤'] = parents_filtered_by_gid_esb
     
     return df
 

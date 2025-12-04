@@ -24,6 +24,8 @@ class ChainTracer:
         参数:
             df: 包含候选节点列的 DataFrame
             use_filtered: 使用哪个过滤列 ('original', 'gid', 'msg')
+                - 'msg': 使用同时满足 global_id 与 ESB/msgType 规则的候选关系
+                        （列：候选子节点_gid_esb过滤 / 候选父节点_gid_esb过滤）
             discard_mode: 抛弃模式
                 - 'branch': 只抛弃该节点及其后续路径（默认，原规则）
                 - 'chain': 抛弃整条链路（包括之前的链路）
@@ -34,8 +36,9 @@ class ChainTracer:
         
         # 选择使用哪个候选列
         if use_filtered == 'msg':
-            self.children_col = '候选子节点_msg过滤'
-            self.parents_col = '候选父节点_msg过滤'
+            # 默认：使用 gid 过滤与 ESB/msgType 规则的交集结果
+            self.children_col = '候选子节点_gid_esb过滤'
+            self.parents_col = '候选父节点_gid_esb过滤'
         elif use_filtered == 'gid':
             self.children_col = '候选子节点_gid过滤'
             self.parents_col = '候选父节点_gid过滤'
@@ -512,19 +515,21 @@ def trace_and_analyze(
     # 统计图结构
     graph_stats_df = tracer.count_graph_structures(chains_df)
     
-    # 检查：除起始点外，候选父节点_msg过滤 的值的长度是否有大于1的情况
-    if '候选父节点_msg过滤' in chains_df.columns and 'depth' in chains_df.columns:
+    # 检查：除起始点外，候选父节点_gid_esb过滤 的值的长度是否有大于1的情况
+    # 由于串联时使用的是候选父节点_gid_esb过滤/候选子节点_gid_esb过滤，
+    # 这里也改为基于该列做一致性检查。
+    if '候选父节点_gid_esb过滤' in chains_df.columns and 'depth' in chains_df.columns:
         non_root_nodes = chains_df[chains_df['depth'] > 1]
         if not non_root_nodes.empty:
             multi_parent_count = non_root_nodes[
-                non_root_nodes['候选父节点_msg过滤'].apply(lambda x: len(x) > 1)
+                non_root_nodes['候选父节点_gid_esb过滤'].apply(lambda x: len(x) > 1)
             ]
             if not multi_parent_count.empty:
-                print(f"\n⚠️ 警告：发现 {len(multi_parent_count)} 个非起始节点有多个候选父节点（msg过滤后）")
+                print(f"\n⚠️ 警告：发现 {len(multi_parent_count)} 个非起始节点有多个候选父节点（gid+ESB过滤后）")
                 print("示例节点：")
-                print(multi_parent_count[['index', 'trace_id', 'depth', 'srcSysname', 'dstSysname', 'msgType', '候选父节点_msg过滤']].head(5))
+                print(multi_parent_count[['index', 'trace_id', 'depth', 'srcSysname', 'dstSysname', 'msgType', '候选父节点_gid_esb过滤']].head(5))
             else:
-                print("\n✓ 检查通过：所有非起始节点的候选父节点_msg过滤数量 ≤ 1")
+                print("\n✓ 检查通过：所有非起始节点的候选父节点_gid_esb过滤数量 ≤ 1")
         else:
             print("\n⚠️ 注意：链路中只有起始节点")
 

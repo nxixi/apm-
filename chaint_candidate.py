@@ -63,6 +63,17 @@ def build_html_doc(mermaid_text: str, choose_index: int, tooltip_data: Dict = No
   .mermaid svg .edgeLabel .label rect {{ fill:#ffffff; stroke:#cbd5e1; }}
   .mermaid svg .edgeLabel .label text {{ fill:#0f172a; font-weight:600; }}
   
+  /* 起始节点高亮样式 */
+  .mermaid svg .node.start-node rect {{
+    fill: #fef3c7 !important;
+    stroke: #f59e0b !important;
+    stroke-width: 2.5px !important;
+  }}
+  .mermaid svg .node.start-node text {{
+    fill: #92400e !important;
+    font-weight: 700 !important;
+  }}
+  
   /* Tooltip 样式 */
   .node-tooltip {{
     position: absolute;
@@ -110,7 +121,7 @@ def build_html_doc(mermaid_text: str, choose_index: int, tooltip_data: Dict = No
     }}
   }});
   
-  // 等待Mermaid渲染完成后添加tooltip事件
+  // 等待Mermaid渲染完成后添加tooltip事件和高亮起始节点
   setTimeout(() => {{
     const tooltip = document.getElementById('tooltip');
     const nodes = document.querySelectorAll('.node');
@@ -137,6 +148,11 @@ def build_html_doc(mermaid_text: str, choose_index: int, tooltip_data: Dict = No
       const data = tooltipData[actualId];
       
       if (data) {{
+        // 如果是起始节点，添加高亮样式类
+        if (data.is_start) {{
+          node.classList.add('start-node');
+        }}
+        
         node.style.cursor = 'pointer';
         
         node.addEventListener('mouseenter', (e) => {{
@@ -247,14 +263,15 @@ def build_mermaid_from_graph_data(nodes_data: List[Dict], edges_data: List[Dict]
         else:
             display_name = sanitize_label(src_sysname)
         
-        start_marker = '[START]' if is_start else ''
-        label = f"{display_name}{start_marker}"
+        # 不再添加 [START] 标记，改用背景高亮
+        label = display_name
 
-        node_map[node_id] = {'label': label}
+        node_map[node_id] = {'label': label, 'is_start': is_start}
         
         # 存储详细信息用于tooltip
         tooltip_data[f"N_{node_id}"] = {
             'index': node_id,
+            'is_start': is_start,  # 记录是否为起始节点
             'srcSysname': sanitize_label(data.get('srcSysname', 'N/A')),
             'dstSysname': sanitize_label(data.get('dstSysname', 'N/A')),
             'r_src_ip': sanitize_label(data.get('r_src_ip', 'N/A')),
@@ -359,7 +376,7 @@ def build_layout():
     # --- 新增：Candidate Trace Tab ---
 
     candidate_trace_controls = fac.AntdSpace([
-        fac.AntdText("起始索引 (Index):", strong=True),
+        fac.AntdText("选择索引 (Index):", strong=True),
         fac.AntdInputNumber(id='start-index-input', min=0, placeholder='输入起始行index', style={'width': 120}),
 
         fac.AntdText("查找模式:", strong=True),
@@ -387,10 +404,18 @@ def build_layout():
             style={'display': 'inline-flex', 'gap': '10px'}
         ),
 
-        fac.AntdButton("查询并绘制链路 (Candidate)", id="btn-candidate-trace", type='primary',
+        fac.AntdDivider(direction='vertical'),
+
+        fac.AntdText("向上步长:", strong=True),
+        fac.AntdInputNumber(id='max-up-steps-input', min=-1, placeholder='-1=不限制', value=-1, style={'width': 100}),
+        
+        fac.AntdText("向下步长:", strong=True),
+        fac.AntdInputNumber(id='max-down-steps-input', min=-1, placeholder='-1=不限制', value=-1, style={'width': 100}),
+
+        fac.AntdButton("查询并绘制链路", id="btn-candidate-trace", type='primary',
                        icon=fac.AntdIcon(icon='antd-compass'), autoSpin=False),
 
-    ], size=12, style={"padding": "16px 0"})
+    ], size=4, style={"padding": "16px 0"})
 
     candidate_trace_tab = [
         candidate_trace_controls,
@@ -642,9 +667,11 @@ def limit_single_checkbox(current_values, state_values):
     State('start-index-input', 'value'),
     State('trace-type-radio', 'value'),
     State('relation-type-checkbox', 'value'),
+    State('max-up-steps-input', 'value'),
+    State('max-down-steps-input', 'value'),
     prevent_initial_call=True
 )
-def on_find_candidate_trace(n_clicks, start_index, trace_type_str, relation_checkbox_list):
+def on_find_candidate_trace(n_clicks, start_index, trace_type_str, relation_checkbox_list, max_up_steps, max_down_steps):
     # 1. 初始化检查和触发检查
     # 只有当 n_clicks 有效时才继续（因为 n_clicks 是唯一的 Input）
     if n_clicks is None or n_clicks < 1:
@@ -689,16 +716,22 @@ def on_find_candidate_trace(n_clicks, start_index, trace_type_str, relation_chec
                 parent_rel = 'same_globalid_parents'
                 child_rel = 'same_globalid_children'
 
-        # 4. 初始化并执行查找器
+        # 4. 处理步长参数（-1 表示不限制，转换为 None）
+        max_up_steps_val = None if (max_up_steps is None or max_up_steps == -1) else int(max_up_steps)
+        max_down_steps_val = None if (max_down_steps is None or max_down_steps == -1) else int(max_down_steps)
+
+        # 5. 初始化并执行查找器
         finder = APMTraceFinder(df)  # 假设 APMTraceFinder 类已定义
         trace_data = finder.find_trace(
             start_index=start_index,
             trace_type=trace_type,
             parent_rel=parent_rel,
-            child_rel=child_rel
+            child_rel=child_rel,
+            max_up_steps=max_up_steps_val,
+            max_down_steps=max_down_steps_val
         )
 
-        # 5. 转换为 Mermaid 格式并渲染 HTML
+        # 6. 转换为 Mermaid 格式并渲染 HTML
         mermaid_text, tooltip_data = build_mermaid_from_graph_data(
             trace_data['nodes'],
             trace_data['edges']

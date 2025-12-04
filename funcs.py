@@ -279,16 +279,31 @@ class APMTraceFinder:
                       start_index: int,
                       parent_col: str,
                       child_col: str,
-                      mode: Literal[1, 2]
+                      mode: Literal[1, 2],
+                      max_up_steps: int = None,
+                      max_down_steps: int = None
                       ) -> Tuple[Set[int], Set[Tuple[int, int]]]:
         """
         核心BFS遍历函数，区分两种模式。
 
         模式1 (Strict Path): 仅向上追踪父节点，向下追踪子节点。
         模式2 (Full Subgraph): 追踪所有邻居（父母和子女），构建完整子图。
+        
+        Parameters:
+        -----------
+        max_up_steps : int, optional
+            向上查找的最大步长，None 或 -1 表示不限制
+        max_down_steps : int, optional
+            向下查找的最大步长，None 或 -1 表示不限制
         """
         if start_index not in self.df.index:
             raise ValueError(f"起始索引 {start_index} 不在数据集中。")
+
+        # 处理步长限制：None 或 -1 表示不限制
+        if max_up_steps is not None and max_up_steps == -1:
+            max_up_steps = None
+        if max_down_steps is not None and max_down_steps == -1:
+            max_down_steps = None
 
         # 使用队列进行 BFS
         queue = deque([start_index])
@@ -299,9 +314,17 @@ class APMTraceFinder:
         # 存储节点的来源方向，只有模式1需要
         # Key: 节点ID, Value: 'up' (来自父节点链) 或 'down' (来自子节点链)
         source_direction: Dict[int, Literal['up', 'down']] = {start_index: 'center'}
+        
+        # 记录每个节点距离起始节点的步数（向上和向下分别记录）
+        up_steps: Dict[int, int] = {start_index: 0}  # 向上步数（负数表示向上）
+        down_steps: Dict[int, int] = {start_index: 0}  # 向下步数（正数表示向下）
 
         while queue:
             u = queue.popleft()  # 当前处理的节点
+
+            # 获取当前节点的步数
+            current_up_steps = up_steps.get(u, 0)
+            current_down_steps = down_steps.get(u, 0)
 
             # 1. 查找和处理父节点 (Edge: p -> u)
             parents = self._get_indices(self.df.at[u, parent_col])
@@ -315,6 +338,15 @@ class APMTraceFinder:
 
                 # 检查是否允许向上追溯
                 is_up_allowed = (mode == 2) or (source_direction.get(u) in ['center', 'up'])
+                
+                # 检查向上步长限制
+                if max_up_steps is not None:
+                    # 计算向上步数：从起始节点向上，步数递增
+                    new_up_steps = current_up_steps + 1
+                    if new_up_steps > max_up_steps:
+                        continue  # 超过步长限制，跳过
+                else:
+                    new_up_steps = current_up_steps + 1
 
                 # 关键修正：只有允许追溯的方向，才添加边和继续追溯
                 if is_up_allowed:
@@ -324,6 +356,8 @@ class APMTraceFinder:
                         visited_nodes.add(p)
                         queue.append(p)
                         source_direction[p] = 'up'
+                        up_steps[p] = new_up_steps
+                        down_steps[p] = current_down_steps  # 保持向下步数不变
                 # else: 如果 mode=1 且 source_direction='down'，则忽略这条侧向边 (24->42, 24->26)
 
             # 遍历子节点
@@ -332,6 +366,15 @@ class APMTraceFinder:
 
                 # 检查是否允许向下追溯
                 is_down_allowed = (mode == 2) or (source_direction.get(u) in ['center', 'down'])
+                
+                # 检查向下步长限制
+                if max_down_steps is not None:
+                    # 计算向下步数：从起始节点向下，步数递增
+                    new_down_steps = current_down_steps + 1
+                    if new_down_steps > max_down_steps:
+                        continue  # 超过步长限制，跳过
+                else:
+                    new_down_steps = current_down_steps + 1
 
                 # 关键修正：只有允许追溯的方向，才添加边和继续追溯
                 if is_down_allowed:
@@ -341,6 +384,8 @@ class APMTraceFinder:
                         visited_nodes.add(c)
                         queue.append(c)
                         source_direction[c] = 'down'
+                        down_steps[c] = new_down_steps
+                        up_steps[c] = current_up_steps  # 保持向上步数不变
 
         return visited_nodes, found_edges
 
@@ -348,7 +393,9 @@ class APMTraceFinder:
                    start_index: int,
                    trace_type: Literal[1, 2] = 2,
                    parent_rel: str = 'candidate_parents',
-                   child_rel: str = 'candidate_children'
+                   child_rel: str = 'candidate_children',
+                   max_up_steps: int = None,
+                   max_down_steps: int = None
                    ) -> Dict:
         """
         主函数：根据指定类型和关系查找链路并格式化为图表数据。
@@ -364,6 +411,10 @@ class APMTraceFinder:
             用于向上追踪的关系列名 (e.g., 'candidate_parents')。
         child_rel : str
             用于向下追踪的关系列名 (e.g., 'candidate_children')。
+        max_up_steps : int, optional
+            向上查找的最大步长，None 或 -1 表示不限制
+        max_down_steps : int, optional
+            向下查找的最大步长，None 或 -1 表示不限制
 
         Returns:
         --------
@@ -378,7 +429,7 @@ class APMTraceFinder:
 
         # 执行遍历
         nodes_set, edges_set = self._traverse_bfs(
-            start_index, parent_rel, child_rel, trace_type
+            start_index, parent_rel, child_rel, trace_type, max_up_steps, max_down_steps
         )
 
         end_time = time.time()
