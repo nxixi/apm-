@@ -11,12 +11,13 @@ import dash
 from dash import html, dcc, Output, Input, State
 from dash import dash_table
 import feffery_antd_components as fac
-from chain_transaction import chain_df
+from chain_transaction_new import chain_df
 #from chain_transaction_with_global_id import chain_df
 import warnings
 warnings.filterwarnings("ignore")
 
-import logging 
+import logging
+from collections import defaultdict
 logging.basicConfig(
     level=logging.INFO,
     format = '%(asctime)s - %(levelname)s - %(message)s',
@@ -96,15 +97,15 @@ def update_f5_source_system_merge_asof3(df, latency_threshold):
     f5_dst_df = result_df.loc[f5_dst_mask, ['start_at_ms', 'msgType', 'dstSysname', 'dst_ip']]
     if f5_src_df.empty or f5_dst_df.empty:
         return result_df
-    
+
     f5_src_df['match_key'] = f5_src_df['dstSysname'] + '-F5'
-    f5_dst_df['match_key'] = f5_dst_df['dstSysname']    
+    f5_dst_df['match_key'] = f5_dst_df['dstSysname']
     del f5_src_df['dstSysname']
-    
+
     f5_src_df['match_ip'] = f5_src_df['dst_ip'].str.split(".").str[0]
-    f5_dst_df['match_ip'] = f5_dst_df['dst_ip'].str.split(".").str[0]    
+    f5_dst_df['match_ip'] = f5_dst_df['dst_ip'].str.split(".").str[0]
     del f5_src_df['dst_ip']
-    
+
     f5_src_df = f5_src_df.sort_values('start_at_ms')
     f5_dst_df = f5_dst_df.sort_values('start_at_ms')
     best_matches = pd.merge_asof(left=f5_src_df, right=f5_dst_df, on='start_at_ms', by=['msgType', 'match_key', 'match_ip'], tolerance=latency_threshold, direction='backward')
@@ -114,26 +115,26 @@ def update_f5_source_system_merge_asof3(df, latency_threshold):
     update_df = best_matches.set_index('index')[['dstSysname', 'dst_ip']]
     update_df.rename(columns={'dstSysname':'srcSysname', 'dst_ip':'src_ip'},inplace=True)
     result_df.update(update_df)
-    
-    def check_containment(row):
-        src_dst = str(row['srcSysname'])
-        dst_dst = str(row['dstSysname'])
-        return 'F5' in src_dst and src_dst != dst_dst + '-F5'
-    containment_mask = result_df.apply(check_containment, axis=1)
-    best_matches = result_df[containment_mask]
-    best_matches.to_csv("not_fit.csv", index=False)
 
-    result_df_none_type = result_df[result_df['msgType'].isna()]
-    result_df_none_type.to_csv("result_df_none_type.csv", index=False)
-    
+    # def check_containment(row):
+    #     src_dst = str(row['srcSysname'])
+    #     dst_dst = str(row['dstSysname'])
+    #     return 'F5' in src_dst and src_dst != dst_dst + '-F5'
+    # containment_mask = result_df.apply(check_containment, axis=1)
+    # best_matches = result_df[containment_mask]
+    # best_matches.to_csv("result/not_fit.csv", index=False)
+
+    # result_df_none_type = result_df[result_df['msgType'].isna()]
+    # result_df_none_type.to_csv("result/result_df_none_type.csv", index=False)
+
     # result_df[(result_df['msgType'].isna()) & () & ()]
     result_df['src_ip_1'] = result_df['src_ip'].str.split(".").str[0]
     result_df['src_ip_2'] = result_df['dst_ip'].str.split(".").str[0]
-    result_df_filter = result_df[(result_df['src_ip_1']!=result_df['src_ip_2']) & (df['srcSysname'].str.contains('F5', na=False))]
-    result_df_filter.to_csv("result_df_filter.csv", index=False)
+    # result_df_filter = result_df[(result_df['src_ip_1']!=result_df['src_ip_2']) & (df['srcSysname'].str.contains('F5', na=False))]
+    # result_df_filter.to_csv("result/result_df_filter.csv", index=False)
     del result_df['src_ip_1']
     del result_df['src_ip_2']
-    
+
 
     return result_df
 
@@ -181,8 +182,8 @@ def search_apm_data(start, end, limit=5000000):
             # df['ori_src_ip'] = df['src_ip']
             # df['ori_dst_ip'] = df['dst_ip']
             #
-            # df.to_csv("data_1117.csv", index=False)
-        df = pd.read_csv("data_20251117.csv")
+            # df.to_csv("result/data_1117.csv", index=False)
+        df = pd.read_csv("data/data_20251117.csv")
 
         df = update_f5_source_system_merge_asof3(df, 36000000)
 
@@ -202,12 +203,13 @@ def search_apm_data(start, end, limit=5000000):
         f5_dst_ip = list(df[df['dstSysname']=='F5']['dst_ip'].unique())
         t6 = time.time()
         logger.info(f"【F5处理】srcSysname为F5的src_ip有：{f5_src_ip}，dstSysname为F5的dst_ip有：{f5_dst_ip}，耗时{round(t6 - t5, 2)}s")
+        df = df.sort_values(by='start_at_ms').reset_index(drop=True)
         df["index"] = df.index
         return df
         # else:
         #     logger.warning(f"【数据丰富】未获取到cmdb数据，丰富失败！")
         #     return pd.DataFrame()
-        
+
 def circled(n: int) -> str:
     #return chr(9311 + n) if 1 <= n <= 20 else f"{n}"
     return f"{n}."
@@ -253,6 +255,7 @@ def build_html_doc(mermaid_text: str, trace_id: int) -> str:
 </body></html>
 """
 
+
 def build_html_doc_system(mermaid_text: str, sysname: str, start, end, trace_length) -> str:
     return f"""
 <!DOCTYPE html>
@@ -284,7 +287,35 @@ def build_html_doc_system(mermaid_text: str, sysname: str, start, end, trace_len
 # start_dt = now_dt - timedelta(minutes=1)
 now_dt = '2025-11-17 11:00:00'
 start_dt ='2025-11-17 10:50:00'
+
+# 读取起始条件
+def load_root_conditions(file_path='root_conditions.txt'):
+    """读取 root_conditions.txt 并返回系统和交易码的映射"""
+    root_conditions = []
+    system_to_msgTypes = defaultdict(set)
+    all_msgTypes = set()
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        system, msgType = parts[0], parts[1]
+                        root_conditions.append((system, msgType))
+                        system_to_msgTypes[system].add(msgType)
+                        all_msgTypes.add(msgType)
         
+        logger.info(f"成功加载 {len(root_conditions)} 个起始条件")
+    except Exception as e:
+        logger.error(f"读取 root_conditions.txt 失败: {e}")
+    
+    return root_conditions, system_to_msgTypes, all_msgTypes
+
+# 在程序启动时加载起始条件
+ROOT_CONDITIONS, SYSTEM_TO_MSGTYPES, ALL_MSGTYPES = load_root_conditions()
+
 def build_layout():
     # now_dt = datetime.now()
     # start_dt = now_dt - timedelta(minutes=1)
@@ -304,13 +335,13 @@ def build_layout():
             style={"width":420}
         ),
         fac.AntdText("left offset",strong=True,style={"color":"white"}),
-        fac.AntdInputNumber(id='left-offset',value=10),
+        fac.AntdInputNumber(id='left-offset',value=0),
         fac.AntdText("right offset",strong=True,style={"color":"white"}),
-        fac.AntdInputNumber(id='right-offset',value=10),
+        fac.AntdInputNumber(id='right-offset',value=0),
         fac.AntdButton("串联",id="btn-query",type='primary',icon=fac.AntdIcon(icon='antd-link'),autoSpin=True),
         #fac.AntdButton("串联",id="btn-link",type='primary',icon=fac.AntdIcon(icon='antd-link'),autoSpin=True),
     ], size=12, style={"padding":"8px 16px"})
-    
+
     apm_static = fac.AntdRow([
         fac.AntdCol([
             fac.AntdTag(id='data-nums',content='查询数据--条', color='green', icon=fac.AntdIcon(icon='antd-check-circle')),
@@ -331,8 +362,8 @@ def build_layout():
             fac.AntdTag(id='global-id-nums',content='global_id数量--个', color='green', icon=fac.AntdIcon(icon='antd-check-circle')),
         ]),
     ])
-    
-    
+
+
     apm_table = fac.AntdTable(
         id="apm-table",
         columns=[
@@ -351,7 +382,8 @@ def build_layout():
             {"title": "dport", "dataIndex": "dport"},
             {"title": "trans_id", "dataIndex": "trans_id"},
             {"title": "probe_name", "dataIndex": "probe_name"},
-            {"title": "parent_row_id", "dataIndex": "parent_row_id"},
+            {"title": "candidate_parents", "dataIndex": "候选父节点"},
+            {"title": "parent_row_id", "dataIndex": "候选父节点_msg过滤"},
             {"title": "trace_id", "dataIndex": "trace_id"},
             {"title": "depth", "dataIndex": "depth"},
         ],
@@ -361,7 +393,7 @@ def build_layout():
         maxWidth=1000,
         style={"width": "100%", "minHeight":"800px"},
     )
-    
+
     trace_select = fac.AntdRow([
         fac.AntdCol([
             fac.AntdText("trace_id: ",strong=True),
@@ -370,9 +402,9 @@ def build_layout():
         # fac.AntdCol([
         #     fac.AntdButton("查看链路",id="view-link",type='primary',icon=fac.AntdIcon(icon='antd-eye'),autoSpin=True)
         # ]),
-        
+
     ])
-    
+
     trace_table = fac.AntdTable(
         id="trace-table",
         columns=[
@@ -391,7 +423,8 @@ def build_layout():
             {"title": "dport", "dataIndex": "dport"},
             {"title": "trans_id", "dataIndex": "trans_id"},
             {"title": "probe_name", "dataIndex": "probe_name"},
-            {"title": "parent_row_id", "dataIndex": "parent_row_id"},
+            {"title": "candidate_parents", "dataIndex": "候选父节点"},
+            {"title": "parent_row_id", "dataIndex": "候选父节点_msg过滤"},
             {"title": "trace_id", "dataIndex": "trace_id"},
             {"title": "depth", "dataIndex": "depth"},
         ],
@@ -401,36 +434,116 @@ def build_layout():
         maxWidth=1000,
         style={"width": "100%"},
     )
-   
+
     trace_result = html.Iframe(id="diagram-frame", style={"width": "100%","minHeight":'1000px',"height":'2000px',"border": 0})
-    
+
     system_select = fac.AntdRow([
         fac.AntdCol([
             fac.AntdText("Sysname: ",strong=True),
-            fac.AntdInput(id='src-sysname', placeholder='please input sysname', style={'width':'350px'})
+            fac.AntdInput(id='system-sysname', placeholder='please input sysname', style={'width':'350px'})
         ]),
         # fac.AntdCol([
         #     fac.AntdButton("查看链路",id="view-system-link",type='primary',icon=fac.AntdIcon(icon='antd-eye'),autoSpin=True)
         # ]),
-        
+
     ])
-    
+
     system_trace_result = html.Iframe(id="diagram-frame-system", style={"width": "100%","minHeight":'1000px',"height":'2000px',"border": 0})
+
+    # 准备 Sysname 下拉框选项
+    sysname_options = [{'label': sys, 'value': sys} for sys in sorted(SYSTEM_TO_MSGTYPES.keys())]
+    
+    # 准备所有 msgType 选项
+    all_msgtype_options = [{'label': msg, 'value': msg} for msg in sorted(ALL_MSGTYPES)]
     
     msgType_select = fac.AntdRow([
         fac.AntdCol([
             fac.AntdSpace([
                 fac.AntdText("Sysname: ",strong=True),
-                fac.AntdInput(id='src-sysname', placeholder='please input sysname', style={'width':'350px'}),
+                fac.AntdSelect(
+                    id='src-sysname',
+                    placeholder='请选择系统',
+                    style={'width':'350px'},
+                    options=sysname_options,
+                    allowClear=True
+                ),
                 fac.AntdText("msgType: ",strong=True),
-                fac.AntdInput(id='src-msgType', placeholder='please input msgType', style={'width':'350px'}),
+                fac.AntdSelect(
+                    id='src-msgType',
+                    placeholder='请选择交易码',
+                    style={'width':'350px'},
+                    options=all_msgtype_options,
+                    allowClear=True
+                ),
                 fac.AntdButton('查询', id="query-button",type='primary',size='large',style={'marginLeft': '10px'})
             ], style={'gap': '16px'})
         ])
     ])
     
-    msgType_trace_result = html.Iframe(id="diagram-frame-msgType", style={"width": "100%","minHeight":'1000px',"height":'2000px',"border": 0})
-   
+    # 图结构统计和选择
+    graph_stats_info = fac.AntdRow([
+        fac.AntdCol([
+            fac.AntdTag(id='graph-stats-tag',content='图结构统计: --', color='blue', icon=fac.AntdIcon(icon='antd-bar-chart')),
+        ]),
+    ], style={'marginTop': '16px'})
+    
+    graph_structure_select = fac.AntdRow([
+        fac.AntdCol([
+            fac.AntdSpace([
+                fac.AntdText("选择图结构: ",strong=True),
+                fac.AntdSelect(
+                    id='graph-structure-select',
+                    placeholder='请先查询，然后选择图结构',
+                    style={'width':'600px'},
+                    options=[],
+                    disabled=True
+                )
+            ], style={'gap': '16px'})
+        ])
+    ], style={'marginTop': '16px'})
+
+    msgType_trace_result = html.Iframe(
+        id="diagram-frame-msgType", 
+        style={
+            "width": "100%",
+            "height": "700px",
+            "border": "1px solid #e5e7eb",
+            "borderRadius": "6px",
+            "overflow": "auto"
+        }
+    )
+    
+    msgType_single_graph_result = html.Iframe(
+        id="diagram-frame-msgType-single", 
+        style={
+            "width": "100%",
+            "height": "700px",
+            "border": "1px solid #e5e7eb",
+            "borderRadius": "6px",
+            "overflow": "auto"
+        }
+    )
+
+
+    # msgType 子 tabs：聚合图和单个图
+    msgType_sub_tabs = fac.AntdTabs(
+        id="msgType-sub-tabs",
+        items=[
+            {
+                "key": "aggregate",
+                "label": "聚合链路图",
+                "children": [msgType_trace_result]
+            },
+            {
+                "key": "single",
+                "label": "单个图结构",
+                "children": [msgType_single_graph_result]
+            }
+        ],
+        defaultActiveKey="aggregate",
+        style={"marginTop": "16px"},
+        type='line'
+    )
     
     tables_tabs = fac.AntdTabs(
         id="tabs-performance",
@@ -438,13 +551,19 @@ def build_layout():
             {"key":"apm","label":"APM","children":[apm_static,fac.AntdDivider(), apm_table]},
             {"key":"trace","label":"Trace","children":[trace_select, fac.AntdDivider(), trace_table, trace_result]},
             {"key":"sysname","label":"Sysname","children":[system_select, fac.AntdDivider(), system_trace_result]},
-            {"key":"msgType","label":"msgType","children":[msgType_select, fac.AntdDivider(), msgType_trace_result]},
+            {"key":"msgType","label":"msgType","children":[
+                msgType_select, 
+                graph_stats_info,
+                graph_structure_select,
+                fac.AntdDivider(),
+                msgType_sub_tabs
+            ]},
         ],
         defaultActiveKey="apm",
         style={"background":"#fff", "padding":12, "borderRadius":6, "boder":"1px solid #e5e7eb", "minHeight":"900px"},
         type='card'
     )
-    
+
     return fac.AntdLayout([
         fac.AntdHeader(
             fac.AntdRow([
@@ -463,8 +582,29 @@ app.title = "交易链路串联"
 app.layout = build_layout()
 
 cached = {
-    "df":pd.DataFrame()
+    "df": pd.DataFrame(),
+    "graph_stats_df": pd.DataFrame(),
+    "matching_graphs": pd.DataFrame(),
+    "matching_trace_ids": [],
+    "start": "",
+    "end": ""
 }
+
+@app.callback(
+    Output('src-msgType', 'options'),
+    Input('src-sysname', 'value'),
+    prevent_initial_call=False
+)
+def update_msgtype_options(selected_system):
+    """根据选择的系统更新 msgType 下拉框选项"""
+    if selected_system is None or selected_system == '':
+        # 如果未选择系统，显示所有 msgType
+        return [{'label': msg, 'value': msg} for msg in sorted(ALL_MSGTYPES)]
+    else:
+        # 如果选择了系统，显示该系统对应的 msgType
+        msgTypes = SYSTEM_TO_MSGTYPES.get(selected_system, set())
+        return [{'label': msg, 'value': msg} for msg in sorted(msgTypes)]
+
 
 @app.callback(
     Output("apm-table", "data",allow_duplicate=True),
@@ -479,36 +619,46 @@ cached = {
     # Output("msgType","value"),
     Input("btn-query", "nClicks"),
     State("picker-range", "value"),
+    State("left-offset", "value"),
+    State("right-offset", "value"),
     prevent_initial_call=True,
 )
-def on_query(n_clicks, date_range):
+def on_query(n_clicks, date_range, left_offset, right_offset):
     if date_range and len(date_range)==2:
         start = date_range[0]
         end = date_range[1]
     else:
         start = ""
         end = ""
+    
+    # 使用用户输入的offset值，如果为空则使用默认值0
+    left_ms = left_offset if left_offset is not None else 0
+    right_ms = right_offset if right_offset is not None else 0
+    
     t1 = time.time()
     df = search_apm_data(start, end)
     t2 = time.time()
     data_nums = len(df)
     data_time = round(t2-t1,1)
     t1 = time.time()
-    df = chain_df(df, left_ms = 0, right_ms = 0)
+    df, graph_stats_df = chain_df(df, left_ms=left_ms, right_ms=right_ms, output_prefix="chain_analysis", discard_mode='chain')
     df['msgType'] = df['msgType'].fillna('None')
     #logger.info(list(df['msgType'].unique()))
     msgTypes = list(df['msgType'].unique())
     #msgTypes.remove("")
-    df.to_csv(f"PSISADP_test_1117.csv",index=False)
+    df.to_csv(f"result/PSISADP_test_1117.csv",index=False)
     #logger.info(df['msgType'].unique())
     cached["df"] = df
+    cached["graph_stats_df"] = graph_stats_df  # 存储 graph_stats_df
     cached["start"] = start
     cached["end"] = end
     t2 = time.time()
     link_nums = len(df['trace_id'].unique())
     link_time = round(t2-t1,1)
-    global_id_rate = round(len(df[df['global_id']!=''])/len(df) * 100, 1)
+    global_id_rate = round(len(df[~df['global_id'].isna()])/len(df) * 100, 1)
     global_id_nums = len(df['global_id'].unique())
+    df['候选父节点'] = df['候选父节点'].apply(lambda x: ','.join([str(i) for i in x]))
+    df['候选父节点_msg过滤'] = df['候选父节点_msg过滤'].apply(lambda x: ','.join([str(i) for i in x]))
     return df[:1000].to_dict('records'), False, f"查询数据：{data_nums}条", f"查询耗时：{data_time}秒", f"串联链路：{link_nums}条", f"串联耗时：{link_time}秒",f"global_id覆盖率: {global_id_rate}%",f"global_id数量: {global_id_nums}"
 # ,msgTypes,msgTypes[0]
 
@@ -523,10 +673,11 @@ def on_query(n_clicks, date_range):
 )
 def on_query(trace_id):
     try:
-        
         trace_id = int(trace_id)
         df = cached["df"]
         trace_df = df[df['trace_id']==int(trace_id)]
+        trace_df['候选父节点'] = trace_df['候选父节点'].apply(lambda x: ','.join([str(i) for i in x]))
+        trace_df['候选父节点_msg过滤'] = trace_df['候选父节点_msg过滤'].apply(lambda x: ','.join([str(i) for i in x]))
         logger.info(f"{trace_id}: {len(trace_df)}")
         trace_rows = trace_df.to_dict('records')
         html_text = build_mermaid_from_rows(trace_rows)
@@ -535,13 +686,13 @@ def on_query(trace_id):
     except Exception as e:
         logger.error(e)
         return dash.no_update, dash.no_update
-    
+
 @app.callback(
     Output("diagram-frame-system", "srcDoc"),
     #Output("trace-table", "data"),
     #Output("view-system-link", "loading"),
     #Input("view-system-link", "nClicks"),
-    Input("src-sysname", "value"),
+    Input("system-sysname", "value"),
     prevent_initial_call=True,
 )
 def on_query(sysname):
@@ -552,7 +703,7 @@ def on_query(sysname):
         trace_ids = list(df[(df['srcSysname']==sysname)&(df['parent_row_id']==-1)]['trace_id'].unique())
         trace_length = len(trace_ids)
         logger.info(f"Find {sysname}下{trace_length}个trace")
-        
+
         #target_trace = list(df[(df['srcSysname']=='PSISADP')&(df['parent_row_id']==-1)]['trace_id'].unique())
         relevant_df = df[df['trace_id'].isin(trace_ids)].copy()
         relevant_df['msgType'] = relevant_df['msgType'].fillna("None")
@@ -566,7 +717,7 @@ def on_query(sysname):
         agg_trace_df = agg_trace_df.sort_values(by=['first_start_at_ms','sort_priority']).drop('sort_priority', axis=1)
         #agg_trace_df["start_at_ms_list"] = agg_trace_df["start_at_ms_list"].apply(lambda t:', '.join(t))
         agg_trace_df.reset_index(drop=True, inplace=True)
-       
+
         # agg_data_list = []
         # for trace_id in trace_ids:
         #     trace_df = df[df['trace_id']==int(trace_id)]
@@ -583,7 +734,7 @@ def on_query(sysname):
     except Exception as e:
         logger.error(e)
         return dash.no_update
-    
+
 # @app.callback(
 #     Output("diagram-frame-msgType", "srcDoc"),
 #     Input("msgType", "value"),
@@ -597,7 +748,7 @@ def on_query(sysname):
 #         trace_ids = list(df[(df['msgType']==msgType)]['trace_id'].unique())
 #         trace_length = len(trace_ids)
 #         logger.info(f"Find {msgType}下{trace_length}个trace")
-        
+
 #         relevant_df = df[df['trace_id'].isin(trace_ids)].copy()
 #         relevant_df['msgType'] = relevant_df['msgType'].fillna("None")
 #         merge_trace_df = (relevant_df.groupby(['trace_id','srcSysname','dstSysname','msgType'])['start_at_ms'].min().reset_index().drop('trace_id', axis=1))
@@ -617,70 +768,103 @@ def on_query(sysname):
 #     except Exception as e:
 #         logger.error(e)
         return dash.no_update
-    
-    
+
+
 from collections import defaultdict, deque
+import pandas as pd
 def filter_trans_from_entry_point(df, entry_point_indices):
     if df.empty:
         return df
-    
+
+    # 1. 确保入口集合类型匹配 (假设 ID 是字符串或数字，保持原样)
     entry_points_set = set(entry_point_indices)
-    
+
+    # 2. 性能优化：使用 zip 代替 iterrows 构建邻接表
+    # 假设 'index' 和 'parent_row_id' 列存在且类型一致
+    # 填充 NaN 为特殊值 (如 -1) 以防转换错误，或者确保数据预处理过
+    ids = df['index'].values
+    parent_ids = df['parent_row_id'].fillna(-1).values
+
     children_map = defaultdict(list)
-    index_to_dfidx = {}
-    
-    for df_idx, row in df.iterrows():
-        row_index = row['index']
-        index_to_dfidx[row_index] = df_idx
-        parent_id = row['parent_row_id']
-        if parent_id >= 0:
-            children_map[int(parent_id)].append(int(row_index))
-    
-    trace_groups = df.groupby('trace_id')
-    
-    rows_to_keep = []
-    
-    for trace_id, trace_df in trace_groups:
-        if trace_id < 0:
+    # 仅当 parent_id 有效时建立映射
+    # 假设有效 ID 都是非负数，或者字符串。这里保留原逻辑 >= 0
+    # 为了通用性，建议不强转 int，除非确定全是数字
+    for child_id, parent_id in zip(ids, parent_ids):
+        # 保持原逻辑：parent_id >= 0 视为有效父节点
+        # 如果 ID 是字符串，这里比较逻辑需要调整 (例如 check if parent_id in valid_ids)
+        try:
+            pid = int(parent_id)
+            cid = int(child_id)
+            if pid >= 0:
+                children_map[pid].append(cid)
+        except (ValueError, TypeError):
+            # 处理非数字 ID 的情况，或者直接跳过
             continue
-            
-        trace_indices = trace_df['index'].tolist()
-        entry_candidates_in_trace = [idx for idx in trace_indices if idx in entry_points_set]
-        
-        if not entry_candidates_in_trace:
-            continue
-            
-        if 'depth' in df.columns:
-            candidate_depths = [(idx, df.loc[index_to_dfidx[idx], 'depth']) for idx in entry_candidates_in_trace]
-            entry_index = min(candidate_depths, key=lambda x: x[1])[0]
-        else:
-            entry_index = entry_candidates_in_trace[0]
-            
-        indices_to_keep = set()
-        queue = deque([entry_index])
-        
-        while queue:
-            current_index = queue.popleft()
-            indices_to_keep.add(current_index)
-            
-            for child_index in children_map.get(current_index, []):
-                if child_index not in indices_to_keep:
-                    queue.append(child_index)
-        
-        rows_to_keep.extend(indices_to_keep)
-    
-    if not rows_to_keep:
+
+    rows_to_keep = set()  # 使用 set 避免不同 trace 产生重复（虽然 trace ID 隔离了，但安全起见）
+
+    # 3. 按 Trace 分组处理
+    # 优化：不直接 groupby 遍历 DataFrame，而是获取 Trace ID 列表，逻辑更清晰
+    # 或者为了利用 groupby 的便利性，保持原样，但逻辑要改
+
+    # 这里的优化思路：
+    # 只要找到所有的入口点，直接把它们扔进 BFS 队列即可。
+    # 其实甚至不需要 groupby('trace_id')，因为 children_map 已经定义了连接关系。
+    # 除非同一个 index ID 在不同 trace 中重复使用（这种情况很罕见，通常 index 是全局唯一的）。
+    # 如果 index 是全局唯一的，我们甚至不需要 groupby。
+
+    # 假设 index 全局唯一（或至少在处理上下文中唯一）：
+
+    # 找出所有存在于当前 DF 中的入口点
+    valid_entry_points = [uid for uid in ids if uid in entry_points_set]
+
+    if not valid_entry_points:
         return pd.DataFrame(columns=df.columns)
-    
-    result_df = df[df['index'].isin(rows_to_keep)].copy()
+
+    # 4. 逻辑修正：将所有入口点放入队列，不再筛选“最小深度”
+    # 这样可以同时保留 Trace 中的多个分支 (A->B, A->C, 入口为 [B,C])
+    queue = deque(valid_entry_points)
+
+    # 用来记录 BFS 访问过的节点，防止死循环
+    visited = set(valid_entry_points)
+
+    # 最终结果集
+    indices_to_keep = set(valid_entry_points)
+
+    while queue:
+        current_index = queue.popleft()
+
+        # 查找子节点
+        # 注意：需要保证 children_map 的 key 类型与 queue 中元素类型一致
+        # 前面构建 map 时转了 int，这里也要转
+        try:
+            curr_int = int(current_index)
+            children = children_map.get(curr_int, [])
+        except:
+            children = []
+
+        for child in children:
+            if child not in visited:
+                visited.add(child)
+                indices_to_keep.add(child)
+                queue.append(child)
+
+    # 5. 返回过滤后的 DataFrame
+    if not indices_to_keep:
+        return pd.DataFrame(columns=df.columns)
+
+    result_df = df[df['index'].isin(indices_to_keep)].copy()
     result_df = result_df.reset_index(drop=True)
-    
+
     return result_df
-    
-    
-    
+
+
 @app.callback(
     Output('diagram-frame-msgType', 'srcDoc'),
+    Output('graph-stats-tag', 'content'),
+    Output('graph-structure-select', 'options'),
+    Output('graph-structure-select', 'disabled'),
+    Output('graph-structure-select', 'value'),  # 添加：清空选择
     # 监听查询按钮的点击次数 (Input)
     Input('query-button', 'nClicks'),
     # 获取系统下拉框的值 (State)
@@ -693,48 +877,75 @@ def filter_trans_from_entry_point(df, entry_point_indices):
 def on_query(n_clicks, selected_system, selected_msgType):
     # 确保只有在点击按钮后才执行查询
     if n_clicks is None:
-        return dash.no_update
+        return dash.no_update, dash.no_update, [], True, dash.no_update
 
     try:
         # 1. 输入校验
         if not selected_system or not selected_msgType:
             logger.warning("System or Message Type not selected.")
-            return dash.no_update
+            return dash.no_update, dash.no_update, [], True, dash.no_update
 
         df = cached['df']
+        graph_stats_df = cached.get('graph_stats_df', pd.DataFrame())  # 获取 graph_stats_df
         start = cached['start']
         end = cached['end']
 
         # ---------------------------------------------------------------------
-        # 2. 新的核心过滤逻辑: 找到符合条件的节点
+        # 2. 从 graph_stats_df 中过滤满足条件的图结构
         # ---------------------------------------------------------------------
-        root_nodes_criteria = (
-                # (df['parent_row_id'] == -1) &  # 必须是根节点
-                (df['srcSysname'] == selected_system + '-F5') &  # 源系统必须匹配
-                (df['msgType'] == selected_msgType)  # 交易类型必须匹配
-        )
-
-        # 提取这些根节点对应的所有 trace_id
-        trace_ids = list(df[root_nodes_criteria]['trace_id'].unique())
-
-        if not trace_ids:
-            logger.info("No traces found matching the root node criteria.")
-            # 如果没有找到链路，返回一个空图表的 HTML
-            html_doc = build_html_doc_system("graph TD; A[未找到符合条件的链路]", selected_system, start, end, 0)
-            return html_doc
-
-        trace_length = len(trace_ids)
-        logger.info(f"Find relevant trace(trace_length): {trace_length} (trace)")
-
-        # ---------------------------------------------------------------------
-        # 3. 完整链路数据提取: 获取这些 trace_id 对应的所有数据行
-        # (不限制后续数据的 msgType)
-        # ---------------------------------------------------------------------
-        relevant_df = df[df['trace_id'].isin(trace_ids)].copy()
+        if graph_stats_df.empty or 'root_conditions' not in graph_stats_df.columns:
+            logger.warning("graph_stats_df is empty or missing root_conditions column")
+            html_doc = build_html_doc_system("graph TD; A[未找到图结构数据]", selected_system, start, end, 0)
+            return html_doc, "图结构统计: 0个", [], True, None
         
-        relevant_df = filter_trans_from_entry_point(relevant_df, list(df[root_nodes_criteria]['index']))
+        # 过滤满足条件的图结构
+        matching_graphs = graph_stats_df[
+            graph_stats_df['root_conditions'].apply(
+                lambda x: any(
+                    (cond[0] == selected_system and cond[1] == selected_msgType) 
+                    for cond in x
+                )
+            )
+        ].copy()
+        
+        if matching_graphs.empty:
+            logger.info("No graph structures found matching the criteria.")
+            html_doc = build_html_doc_system("graph TD; A[未找到符合条件的图结构]", selected_system, start, end, 0)
+            return html_doc, "图结构统计: 0个", [], True, None
+        
+        # 统计信息
+        total_graphs = len(matching_graphs)
+        total_trace_ids = []
+        for trace_id_list in matching_graphs['trace_id']:
+            total_trace_ids.extend(trace_id_list)
+        total_chains = len(total_trace_ids)
+        
+        logger.info(f"Found {total_graphs} graph structures with {total_chains} chains")
+        
+        # 准备下拉框选项
+        select_options = []
+        for idx, row in matching_graphs.iterrows():
+            graph_id = row['graph_id']
+            chain_count = len(row['trace_id'])
+            node_count = row['节点数']
+            edge_count = row['边数']
+            label = f"图结构#{graph_id} - {chain_count}条链路, {node_count}节点, {edge_count}边"
+            select_options.append({'label': label, 'value': graph_id})
+        
+        # 将匹配的图结构信息存入 cached，供后续使用
+        cached['matching_graphs'] = matching_graphs
+        cached['matching_trace_ids'] = total_trace_ids
 
-        # 数据清洗和聚合 (保留原逻辑，操作新的 relevant_df)
+        # ---------------------------------------------------------------------
+        # 3. 聚合所有匹配的 trace_id，生成聚合链路图
+        # ---------------------------------------------------------------------
+        relevant_df = df[df['trace_id'].isin(total_trace_ids)].copy()
+        
+        if relevant_df.empty:
+            html_doc = build_html_doc_system("graph TD; A[未找到对应的链路数据]", selected_system, start, end, 0)
+            return html_doc, f"图结构统计: {total_graphs}个结构, {total_chains}条链路", select_options, False, None
+
+        # 数据清洗和聚合
         relevant_df = relevant_df.fillna({'msgType': 'None'})
 
         # 聚合步骤
@@ -743,34 +954,138 @@ def on_query(n_clicks, selected_system, selected_msgType):
         dfs = new_trace_df.groupby(['srcSysname', 'dstSysname', 'msgType'])
         agg_trace_list = []
 
-        # 只选择 符合条件的节点 后面的路径
+        # 聚合所有匹配的链路
         for k, v in dfs:
-            # if k[2] == selected_msgType:
-                # 假设 k[0] 是 srcSysname, k[1] 是 dstSysname, k[2] 是 msgType
-                agg_trace_list.append([k[0], k[1], k[2], v['start_at_ms'].min(), list(v['start_at_ms'])])
+            agg_trace_list.append([k[0], k[1], k[2], v['start_at_ms'].min(), list(v['start_at_ms'])])
 
         agg_trace_df = pd.DataFrame(agg_trace_list, columns=['srcSysname', 'dstSysname', 'msgType', 'first_start_at_ms',
                                                              'start_at_ms_list'])
 
         # 排序和图表生成
         agg_trace_df['agg_trace_sort_priority'] = agg_trace_df['srcSysname'].str.contains('F5').astype(int)
-        # 注意: 修复了原代码中 sort_values 列名 'sort_priority' 的错误
         agg_trace_df = agg_trace_df.sort_values(by=['first_start_at_ms', 'agg_trace_sort_priority'], ascending=True)
         agg_trace_df = agg_trace_df.drop('agg_trace_sort_priority', axis=1)
 
         agg_trace_df = agg_trace_df.reset_index(drop=True)
         agg_trace_rows = agg_trace_df.to_dict('records')
 
-        # 构建 Mermaid 图和 HTML 文档
+        # 构建聚合 Mermaid 图和 HTML 文档
         mermaid_text = build_mermaid_from_rows(agg_trace_rows)
-        # 传入 selected_system 作为额外的文档参数
-        html_doc = build_html_doc_system(mermaid_text, selected_system, start, end, trace_length)
-        return html_doc
+        title = f"{selected_system} - {selected_msgType} (聚合)"
+        html_doc = build_html_doc_system(mermaid_text, title, start, end, total_chains)
+        
+        stats_text = f"图结构统计: {total_graphs}个结构, {total_chains}条链路"
+        return html_doc, stats_text, select_options, False, None
 
     except Exception as e:
         logger.error(e)
-        return dash.no_update
+        return dash.no_update, dash.no_update, [], True, None
+
+
+@app.callback(
+    Output('diagram-frame-msgType-single', 'srcDoc'),
+    Input('graph-structure-select', 'value'),
+    prevent_initial_call=False  # 允许初始调用，以便清空时也能触发
+)
+def on_graph_structure_select(selected_graph_id):
+    """根据选择的图结构显示详细链路图"""
+    if selected_graph_id is None:
+        # 返回空白提示页面
+        return """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>请选择图结构</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #f5f7fa;
+        }
+        .message {
+            text-align: center;
+            color: #999;
+            font-size: 16px;
+        }
+    </style>
+</head>
+<body>
+    <div class="message">
+        <p>请从上方下拉框中选择一个图结构</p>
+    </div>
+</body>
+</html>
+"""
     
+    try:
+        # 从 cached 中获取匹配的图结构
+        matching_graphs = cached.get('matching_graphs', pd.DataFrame())
+        df = cached.get('df', pd.DataFrame())
+        start = cached.get('start', '')
+        end = cached.get('end', '')
+        
+        if matching_graphs.empty or df.empty:
+            return dash.no_update
+        
+        # 根据 graph_id 查找对应的行
+        selected_rows = matching_graphs[matching_graphs['graph_id'] == selected_graph_id]
+        if selected_rows.empty:
+            logger.warning(f"Graph ID {selected_graph_id} not found in matching_graphs")
+            return "<!DOCTYPE html><html><body><h3>未找到该图结构</h3></body></html>"
+        
+        selected_row = selected_rows.iloc[0]
+        trace_ids = selected_row['trace_id']
+        chain_count = len(trace_ids)
+        
+        logger.info(f"Selected graph structure #{selected_graph_id} with {chain_count} chains")
+        
+        # 获取该图结构的所有链路数据
+        relevant_df = df[df['trace_id'].isin(trace_ids)].copy()
+        
+        if relevant_df.empty:
+            return "<!DOCTYPE html><html><body><h3>未找到对应的链路数据</h3></body></html>"
+        
+        # 数据清洗和聚合
+        relevant_df = relevant_df.fillna({'msgType': 'None'})
+        
+        # 聚合步骤
+        new_trace_df = relevant_df.groupby(['trace_id', 'srcSysname', 'dstSysname', 'msgType'])[
+            'start_at_ms'].min().reset_index().drop('trace_id', axis=1)
+        dfs = new_trace_df.groupby(['srcSysname', 'dstSysname', 'msgType'])
+        agg_trace_list = []
+        
+        for k, v in dfs:
+            agg_trace_list.append([k[0], k[1], k[2], v['start_at_ms'].min(), list(v['start_at_ms'])])
+        
+        agg_trace_df = pd.DataFrame(agg_trace_list, columns=['srcSysname', 'dstSysname', 'msgType', 'first_start_at_ms',
+                                                             'start_at_ms_list'])
+        
+        # 排序
+        agg_trace_df['agg_trace_sort_priority'] = agg_trace_df['srcSysname'].str.contains('F5').astype(int)
+        agg_trace_df = agg_trace_df.sort_values(by=['first_start_at_ms', 'agg_trace_sort_priority'], ascending=True)
+        agg_trace_df = agg_trace_df.drop('agg_trace_sort_priority', axis=1)
+        
+        agg_trace_df = agg_trace_df.reset_index(drop=True)
+        agg_trace_rows = agg_trace_df.to_dict('records')
+        
+        # 构建 Mermaid 图
+        mermaid_text = build_mermaid_from_rows(agg_trace_rows)
+        title = f"图结构 #{selected_graph_id}"
+        html_doc = build_html_doc_system(mermaid_text, title, start, end, chain_count)
+        
+        return html_doc
+    
+    except Exception as e:
+        logger.error(f"Error in graph structure selection: {e}")
+        return dash.no_update
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5556, debug=True)

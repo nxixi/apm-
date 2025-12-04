@@ -169,8 +169,8 @@ class APMDataLinker:
                 # 确保父节点在当前节点之前 (基于 sort_values('start_at_ms'))
                 # 注意：如果存在时钟偏差，父节点可能略晚于子节点开始，如果需要处理这种情况，
                 # 可以移除这个 if check，仅依赖下面的时间窗口判断。
-                if parent_idx >= current_idx:
-                    continue
+                # if parent_idx >= current_idx:
+                #     continue
 
                 parent_start_time = start_times[parent_idx]
                 parent_end_time = end_times[parent_idx]
@@ -231,35 +231,6 @@ def optimize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
     return df
-
-
-# 使用示例
-if __name__ == "__main__":
-    # 创建模拟数据
-    data = {
-        'start_at_ms': [100, 105, 110, 200, 102],
-        'latency_msec': [50, 10, 10, 20, 40],
-        'r_src_ip': ['1.1.1.1', '2.2.2.2', '2.2.2.2', '3.3.3.3', '4.4.4.4'],
-        'r_dst_ip': ['2.2.2.2', '3.3.3.3', '5.5.5.5', '6.6.6.6', '2.2.2.2'],
-        'msgType': ['TypeA', 'TypeA', 'TypeB', 'TypeA', 'TypeA'],
-        'global_id': ['gid1', 'gid1', 'gid2', 'gid3', 'gid1']
-    }
-    df = pd.DataFrame(data)
-    # 计算 end_at_ms
-    df['end_at_ms'] = df['start_at_ms'] + df['latency_msec']
-
-    # 优化数据类型
-    # df = optimize_dataframe(df) # 假设你有这个函数
-
-    linker = APMDataLinker(left_offset=10, right_offset=10)
-    result_df = linker.link_apm_data(df)
-
-    # 打印结果查看
-    cols = ['index', 'start_at_ms', 'candidate_parents', 'candidate_children',
-            'same_globalid_parents', 'same_globalid_children']
-    print(result_df[cols].to_string())
-
-
 
 
 # ==============================================================================
@@ -340,31 +311,36 @@ class APMTraceFinder:
 
             # 遍历父节点
             for p in parents:
-                if p not in self.df.index: continue  # 检查父节点是否在数据范围内
+                if p not in self.df.index: continue
 
-                found_edges.add((p, u))  # 关系：父节点指向当前节点
-
-                # 模式1 限制：只允许沿着原始的向上链条继续向上
+                # 检查是否允许向上追溯
                 is_up_allowed = (mode == 2) or (source_direction.get(u) in ['center', 'up'])
 
-                if is_up_allowed and p not in visited_nodes:
-                    visited_nodes.add(p)
-                    queue.append(p)
-                    source_direction[p] = 'up'
+                # 关键修正：只有允许追溯的方向，才添加边和继续追溯
+                if is_up_allowed:
+                    found_edges.add((p, u))  # 关系：父节点指向当前节点 (只在允许时添加边)
+
+                    if p not in visited_nodes:
+                        visited_nodes.add(p)
+                        queue.append(p)
+                        source_direction[p] = 'up'
+                # else: 如果 mode=1 且 source_direction='down'，则忽略这条侧向边 (24->42, 24->26)
 
             # 遍历子节点
             for c in children:
-                if c not in self.df.index: continue  # 检查子节点是否在数据范围内
+                if c not in self.df.index: continue
 
-                found_edges.add((u, c))  # 关系：当前节点指向子节点
-
-                # 模式1 限制：只允许沿着原始的向下链条继续向下
+                # 检查是否允许向下追溯
                 is_down_allowed = (mode == 2) or (source_direction.get(u) in ['center', 'down'])
 
-                if is_down_allowed and c not in visited_nodes:
-                    visited_nodes.add(c)
-                    queue.append(c)
-                    source_direction[c] = 'down'
+                # 关键修正：只有允许追溯的方向，才添加边和继续追溯
+                if is_down_allowed:
+                    found_edges.add((u, c))  # 关系：当前节点指向子节点
+
+                    if c not in visited_nodes:
+                        visited_nodes.add(c)
+                        queue.append(c)
+                        source_direction[c] = 'down'
 
         return visited_nodes, found_edges
 
@@ -413,30 +389,39 @@ class APMTraceFinder:
         nodes_data = []
         for index in nodes_set:
             row = self.df.loc[index]
+            
+            # 将pandas Series转换为字典，并添加is_start标记
+            row_dict = row.to_dict()
+            row_dict['is_start'] = (index == start_index)
 
             # 为图表节点准备数据
             node_data = {
                 'id': str(index),
-                'label': f"Idx:{index} | Src:{row['r_src_ip']}",
+                'label': f"Idx:{index} | Src:{row.get('r_src_ip', 'N/A')}",
                 # 可以在这里添加更多属性用于样式或显示
-                'data': {
-                    'index': index,
-                    'start_time': row['start_at_ms'],
-                    'latency': row['latency_msec'],
-                    'msgType': row['msgType'],
-                    'is_start': index == start_index
-                }
+                'data': row_dict
             }
             nodes_data.append(node_data)
 
         edges_data = []
         for source, target in edges_set:
+            # 尝试获取源节点的msgType作为边标签
+            try:
+                source_row = self.df.loc[source]
+                msg_type = source_row.get('msgType', '')
+                # 如果msgType存在且不是None/NaN，使用它；否则留空
+                if pd.notna(msg_type) and msg_type != '' and msg_type != 'None':
+                    edge_label = str(msg_type)
+                else:
+                    edge_label = ''  # 留空，让图更简洁
+            except:
+                edge_label = ''
+            
             edges_data.append({
                 'id': f"{source}-{target}",
                 'source': str(source),
                 'target': str(target),
-                # 边的类型可以根据msgType或global_id来设定
-                'label': f"{source} -> {target}"
+                'label': edge_label
             })
 
         return {
@@ -444,3 +429,33 @@ class APMTraceFinder:
             'edges': edges_data
         }
 
+
+if __name__ == '__main__':
+    df = pd.read_csv('result/candidate_result_20251117.csv')
+
+    ip_to_indices = {}
+    # 如果数据量巨大，可以调整 batch_size
+    batch_size = 100000
+
+    for start_idx in range(0, len(df), batch_size):
+        end_idx = min(start_idx + batch_size, len(df))
+        batch_df = df.iloc[start_idx:end_idx]
+
+        for idx, row in batch_df.iterrows():
+            dst_ip = row['r_dst_ip']
+            if pd.notna(dst_ip):  # 简单的空值检查
+                if dst_ip not in ip_to_indices:
+                    ip_to_indices[dst_ip] = []
+                ip_to_indices[dst_ip].append(idx)
+
+    a = 1
+
+    # finder = APMTraceFinder(result_df)
+    # trace_data_type1 = finder.find_trace(
+    #     start_index=2,  # 假设从索引 2 开始查找
+    #     trace_type=1,
+    #     parent_rel='candidate_parents',
+    #     child_rel='candidate_children'
+    # )
+
+    a = 1
