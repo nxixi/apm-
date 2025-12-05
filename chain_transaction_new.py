@@ -357,7 +357,7 @@ def _add_filtered_columns(df: pd.DataFrame) -> pd.DataFrame:
                 # 如果满足 ESB/F5 结构，并且 msgType 不一致，则剔除
                 if _esb_requires_same_msg(parent_idx, current_index):
                     parent_msg = index_to_msg.get(parent_idx, None)
-                    if pd.isna(parent_msg) or pd.isna(current_msg) or parent_msg != current_msg:
+                    if not (pd.isna(parent_msg) or pd.isna(current_msg)) and parent_msg != current_msg:
                         continue
                 parents_esb_filtered.append(parent_idx)
         else:
@@ -534,6 +534,40 @@ def chain_df_heap(df: pd.DataFrame, left_ms: int = 0, right_ms: int = 0) -> pd.D
     # 添加过滤列
     print("添加过滤列...")
     result_df = _add_filtered_columns(result_df)
+    
+    # 统计各过滤列的候选节点数量 > 1 的占比
+    print("\n" + "="*80)
+    print("候选节点数量统计（>1 的占比）")
+    print("="*80)
+    
+    total_rows = len(result_df)
+    if total_rows > 0:
+        # 需要统计的列
+        cols_to_check = [
+            ('候选父节点', '候选父节点'),
+            ('候选子节点', '候选子节点'),
+            ('候选父节点_gid过滤', '候选父节点_gid过滤'),
+            ('候选子节点_gid过滤', '候选子节点_gid过滤'),
+            ('候选父节点_msg过滤', '候选父节点_msg过滤'),
+            ('候选子节点_msg过滤', '候选子节点_msg过滤'),
+            ('候选父节点_esb_msg过滤', '候选父节点_esb_msg过滤'),
+            ('候选子节点_esb_msg过滤', '候选子节点_esb_msg过滤'),
+            ('候选父节点_gid_esb过滤', '候选父节点_gid_esb过滤'),
+            ('候选子节点_gid_esb过滤', '候选子节点_gid_esb过滤'),
+        ]
+        
+        for col_name, col_key in cols_to_check:
+            if col_key in result_df.columns:
+                # 统计该列值（列表）长度 > 1 的行数
+                gt1_count = result_df[col_key].apply(lambda x: len(x) if isinstance(x, list) else 0).gt(1).sum()
+                percentage = (gt1_count / total_rows * 100) if total_rows > 0 else 0
+                print(f"{col_name:25s}: {gt1_count:6d}/{total_rows:6d} ({percentage:6.2f}%)")
+            else:
+                print(f"{col_name:25s}: 列不存在")
+    else:
+        print("数据为空，无法统计")
+    
+    print("="*80 + "\n")
     
     total_time = time.time() - start_time
     print(f"串联完成！共处理 {n} 条记录，总耗时: {total_time:.2f}秒")
