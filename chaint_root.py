@@ -6,6 +6,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from collections import deque, defaultdict
 import json
+import re
 import time
 import logging
 
@@ -37,6 +38,26 @@ def load_root_conditions(file_path='root_conditions.txt'):
     except Exception as e:
         logger.error(f"读取 {file_path} 失败: {e}")
     return root_conditions
+
+
+def build_system_msgtype_map(root_conditions):
+    """构建系统到交易码的映射"""
+    from collections import defaultdict
+    system_to_msgtypes = defaultdict(set)
+    all_systems = set()
+    all_msgtypes = set()
+    
+    for system, msgtype in root_conditions:
+        system_to_msgtypes[system].add(msgtype)
+        all_systems.add(system)
+        all_msgtypes.add(msgtype)
+    
+    return system_to_msgtypes, sorted(all_systems), sorted(all_msgtypes)
+
+
+# 在程序启动时加载并构建映射
+ROOT_CONDITIONS = load_root_conditions()
+SYSTEM_TO_MSGTYPES, ALL_SYSTEMS, ALL_MSGTYPES = build_system_msgtype_map(ROOT_CONDITIONS)
 
 
 def update_f5_source_system_merge_asof3(df, latency_threshold):
@@ -86,7 +107,7 @@ def search_apm_data(start, end, limit=5000000):
         return pd.DataFrame()
     start_timestamp = int(datetime.strptime(start, '%Y-%m-%d %H:%M:%S').timestamp() * 1000)
     end_timestamp = int(datetime.strptime(end, '%Y-%m-%d %H:%M:%S').timestamp() * 1000)
-    df = pd.read_csv("data/data_mock_20251117.csv")
+    df = pd.read_csv("data/data_20251117.csv")
     df['end_at_ms'] = df['start_at_ms'] + df['latency_msec']
     df = df[(df['start_at_ms'] >= start_timestamp) & (df['end_at_ms'] <= end_timestamp)]
     df = update_f5_source_system_merge_asof3(df, 36000000)
@@ -319,6 +340,199 @@ def build_downstream_trace(df, start_index, left_offset, right_offset,
     return result_df
 
 
+# ================ Mermaid 图构建 ================
+def _sanitize_id(name: str) -> str:
+    """将业务系统名转为 mermaid 可用的节点 id"""
+    if name is None:
+        return "unknown"
+    return re.sub(r'[^a-zA-Z0-9_]', '_', str(name)) or "unknown"
+
+
+def _escape_label(label: str) -> str:
+    """
+    将 label 中 mermaid 可能无法解析的字符做转义/替换
+    - 双引号、反引号、竖线用空格替换
+    - 反斜杠转义
+    """
+    if label is None:
+        return ""
+    text = str(label)
+    text = text.replace("\\", "\\\\")
+    text = re.sub(r'["`|]', ' ', text)
+    return text
+
+
+def build_mermaid_from_downstream(rows: list, start_index: int):
+    """
+    将下游链路表格数据转换为 mermaid 文本，并返回节点/边的 tooltip 数据
+    节点：业务系统名；hover 显示 IP
+    边：label 显示 msgType；hover 显示 start/end/latency/global_id
+    """
+    nodes = {}
+    edges = []
+
+    for row in rows:
+        src_label = str(row.get('srcSysname') or 'UNKNOWN_SRC')
+        dst_label = str(row.get('dstSysname') or 'UNKNOWN_DST')
+        src_ip = str(row.get('r_src_ip') or '')
+        dst_ip = str(row.get('r_dst_ip') or '')
+        src_id = f"N_{_sanitize_id(src_label)}"
+        dst_id = f"N_{_sanitize_id(dst_label)}"
+        edge_idx = row.get('index')
+        label_orig = str(row.get('msgType') or 'None')
+        # 在 label 上附加 index 标记并换行，便于视觉区分与反查唯一边
+        label_with_idx = (
+            f"{label_orig}<br/>index{edge_idx}" if edge_idx is not None else label_orig
+        )
+
+        # 记录节点信息（重复节点只保留首次）
+        if src_id not in nodes:
+            nodes[src_id] = {"label": src_label, "ip": src_ip, "is_start": False}
+        if dst_id not in nodes:
+            nodes[dst_id] = {"label": dst_label, "ip": dst_ip, "is_start": False}
+
+        # 标记起始行对应的源节点
+        if row.get('index') == start_index:
+            nodes[src_id]["is_start"] = True
+
+        edges.append({
+            "edge_id": str(edge_idx) if edge_idx is not None else "",
+            "src": src_id,
+            "dst": dst_id,
+            "label": label_orig,
+            "label_with_idx": label_with_idx,
+            "start_at_ms": str(row.get('start_at_ms') or ''),
+            "end_at_ms": str(row.get('end_at_ms') or ''),
+            "latency_msec": str(row.get('latency_msec') or ''),
+            "global_id": str(row.get('global_id') or '')
+        })
+
+    # 生成 mermaid 文本
+    lines = ["flowchart LR"]
+    for node_id, info in nodes.items():
+        lines.append(f'{node_id}["{_escape_label(info["label"])}"]')
+    for e in edges:
+        lines.append(f'{e["src"]} -->|{_escape_label(e["label_with_idx"])}| {e["dst"]}')
+
+    return "\n".join(lines) + "\n", nodes, edges
+
+
+def build_html_doc_downstream(mermaid_text: str, nodes: dict, edges: list, title: str) -> str:
+    """生成带 tooltip 的 Mermaid HTML 文档"""
+    tooltip_json_nodes = json.dumps(nodes)
+    tooltip_json_edges = json.dumps(edges)
+    return f"""
+<!DOCTYPE html>
+<html lang=\"zh-CN\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>下游链路</title>
+<style>
+  body{{margin:0;background:#f5f7fa;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif}}
+  .container{{padding:16px}}
+  .card{{background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;box-shadow:0 6px 24px rgba(15,23,42,0.08);padding:16px;position:relative;overflow:hidden}}
+  .title{{text-align:center;font-weight:700;font-size:18px;margin:4px 0 12px;color:#0f172a;letter-spacing:.2px}}
+  .mermaid{{background:transparent}}
+  .mermaid svg {{ color:#0f172a; }}
+  .mermaid svg .node rect {{ fill:#ffffff; stroke:#334155; stroke-width:1.2; }}
+  .mermaid svg .node text {{ fill:#0f172a; font-weight:600; }}
+  .mermaid svg .edgePath path {{ stroke:#334155; stroke-width:1.8; }}
+  .mermaid svg .edgeLabel .label rect {{ fill:#ffffff; stroke:#cbd5e1; }}
+  .mermaid svg .edgeLabel .label text {{ fill:#0f172a; font-weight:600; }}
+  .mermaid svg .node.start-node rect {{ fill: #fef3c7 !important; stroke: #f59e0b !important; stroke-width: 2.2px !important; }}
+  .mermaid svg .node.start-node text {{ fill: #92400e !important; font-weight: 700 !important; }}
+  .node-tooltip {{
+    position: absolute; background: rgba(0,0,0,0.9); color: #fff; padding: 12px 16px;
+    border-radius: 8px; font-size: 13px; line-height: 1.6; pointer-events: none; z-index: 9999;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3); max-width: 420px; white-space: nowrap; display: none;
+  }}
+  .node-tooltip .tooltip-row {{ margin: 2px 0; }}
+  .node-tooltip .tooltip-label {{ color: #94a3b8; font-weight: 600; margin-right: 8px; }}
+  .node-tooltip .tooltip-value {{ color: #e2e8f0; }}
+</style>
+</head><body>
+<div class=\"container\"><div class=\"card\"><div class=\"title\">{title}</div>
+<div class=\"mermaid\">{mermaid_text}</div></div></div>
+<div id="tooltip" class="node-tooltip"></div>
+<script src="/assets/mermaid.min.js"></script>
+<script>
+  const nodeData = {tooltip_json_nodes};
+  const edgeData = {tooltip_json_edges};
+  mermaid.initialize({{
+    startOnLoad: true,
+    theme: 'default',
+    securityLevel: 'loose',
+    // 使用线性曲线减少大弧度，避免 label 离连线过远
+    flowchart: {{ curve: 'linear', rankSpacing: 120, nodeSpacing: 70 }}
+  }});
+
+  setTimeout(() => {{
+    const tooltip = document.getElementById('tooltip');
+
+    // 1) 适配 mermaid 生成的节点 id（形如 flowchart-xxxx-N_xxx）
+    const extractNodeId = (rawId) => {{
+      const m = String(rawId).match(/(N_[A-Za-z0-9_]+)/);
+      return m ? m[1] : String(rawId);
+    }};
+
+    // 节点 tooltip
+    document.querySelectorAll('.node').forEach(node => {{
+      const nid = extractNodeId(node.id);
+      const data = nodeData[nid];
+      if (data) {{
+        if (data.is_start) {{ node.classList.add('start-node'); }}
+        node.style.cursor = 'pointer';
+        node.addEventListener('mouseenter', (e) => {{
+          tooltip.innerHTML = `
+            <div class="tooltip-row"><span class="tooltip-label">系统:</span><span class="tooltip-value">${{data.label}}</span></div>
+            <div class="tooltip-row"><span class="tooltip-label">IP:</span><span class="tooltip-value">${{data.ip}}</span></div>
+          `;
+          tooltip.style.display = 'block';
+        }});
+        node.addEventListener('mousemove', (e) => {{
+          tooltip.style.left = (e.pageX + 15) + 'px';
+          tooltip.style.top = (e.pageY + 15) + 'px';
+        }});
+        node.addEventListener('mouseleave', () => {{ tooltip.style.display = 'none'; }});
+      }}
+    }});
+
+    // 2) 边 tooltip：按 edge_id（index 唯一）匹配，避免错位
+    document.querySelectorAll('.edgeLabel').forEach((el) => {{
+      const labelText = el.textContent.trim();
+      const m = labelText.match(/index(\d+)/);
+      const edgeId = m ? m[1] : '';
+
+      let data = null;
+      for (let i = 0; i < edgeData.length; i++) {{
+        if ((edgeData[i].edge_id || '') === edgeId) {{
+          data = edgeData[i];
+          break;
+        }}
+      }}
+      if (!data) return;
+
+      el.style.cursor = 'pointer';
+      el.addEventListener('mouseenter', () => {{
+        tooltip.innerHTML = `
+          <div class="tooltip-row"><span class="tooltip-label">msgType:</span><span class="tooltip-value">${{data.label}}</span></div>
+          <div class="tooltip-row"><span class="tooltip-label">start_at_ms:</span><span class="tooltip-value">${{data.start_at_ms}}</span></div>
+          <div class="tooltip-row"><span class="tooltip-label">end_at_ms:</span><span class="tooltip-value">${{data.end_at_ms}}</span></div>
+          <div class="tooltip-row"><span class="tooltip-label">latency_msec:</span><span class="tooltip-value">${{data.latency_msec}}</span></div>
+          <div class="tooltip-row"><span class="tooltip-label">global_id:</span><span class="tooltip-value">${{data.global_id}}</span></div>
+        `;
+        tooltip.style.display = 'block';
+      }});
+      el.addEventListener('mousemove', (e) => {{
+        tooltip.style.left = (e.pageX + 15) + 'px';
+        tooltip.style.top = (e.pageY + 15) + 'px';
+      }});
+      el.addEventListener('mouseleave', () => {{ tooltip.style.display = 'none'; }});
+    }});
+  }}, 800);
+</script>
+</body></html>
+"""
+
+
 # ================= Dash App =================
 
 # now_dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -348,14 +562,30 @@ def build_layout():
             showTime=True,
             format='YYYY-MM-DD HH:mm:ss',
             defaultValue=[start_dt, now_dt],
-            style={"width": 420}
+            style={"width": 350}
         ),
         fac.AntdText("left offset(ms)", strong=True, style={"color": "white"}),
-        fac.AntdInputNumber(id='left-offset', value=0, style={"width": 100}),
+        fac.AntdInputNumber(id='left-offset', value=0, style={"width": 70}),
         fac.AntdText("right offset(ms)", strong=True, style={"color": "white"}),
-        fac.AntdInputNumber(id='right-offset', value=0, style={"width": 100}),
+        fac.AntdInputNumber(id='right-offset', value=0, style={"width": 70}),
+        fac.AntdText("业务系统:", strong=True, style={"color": "white"}),
+        fac.AntdSelect(
+            id='root-system-select',
+            placeholder='请选择业务系统（不选则显示全部）',
+            style={'width': 150},
+            options=[{'label': sys, 'value': sys} for sys in ALL_SYSTEMS],
+            allowClear=True
+        ),
+        fac.AntdText("交易码:", strong=True, style={"color": "white"}),
+        fac.AntdSelect(
+            id='root-msgtype-select',
+            placeholder='请选择交易码（不选则显示全部）',
+            style={'width': 150},
+            options=[],  # 初始为空，根据业务系统名动态更新
+            allowClear=True
+        ),
         fac.AntdButton("查询", id="btn-query", type='primary', icon=fac.AntdIcon(icon='antd-search'), autoSpin=True),
-    ], size=12, style={"padding": "8px 16px"})
+    ], size=8, style={"padding": "8px 16px", "display": "flex", "flexWrap": "wrap", "alignItems": "center"})
 
     root_table = fac.AntdTable(
         id="root-table",
@@ -433,8 +663,22 @@ def build_layout():
         style={"minWidth": "1000px", "minHeight": "400px"}
     )
 
+    downstream_graph = html.Iframe(
+        id="downstream-graph",
+        style={
+            "width": "100%",
+            "minHeight": "500px",
+            "border": "1px solid #e5e7eb",
+            "borderRadius": "6px",
+            "marginTop": "16px"
+        }
+    )
+
     layout = fac.AntdLayout([
-        fac.AntdHeader(fac.AntdRow([query_bar]), style={"background": "#001529"}),
+        fac.AntdHeader(
+            fac.AntdRow([fac.AntdCol(query_bar, span=24)]),
+            style={"background": "#001529", "padding": "0 16px"}
+        ),
         fac.AntdContent([
             # 第一张卡片：上方为查找配置组件，下方为重点交易码数据表
             fac.AntdCard(
@@ -444,10 +688,13 @@ def build_layout():
             ),
             # 第二张卡片：仅展示下游链路结果表，外层增加水平滚动容器
             fac.AntdCard(
-                html.Div(
-                    downstream_table,
-                    style={"width": "100%", "overflowX": "auto"}
-                ),
+                [
+                    html.Div(
+                        downstream_table,
+                        style={"width": "100%", "overflowX": "auto"}
+                    ),
+                    downstream_graph
+                ],
                 title="下游链路结果",
             )
         ], style={"padding": 16})
@@ -461,6 +708,22 @@ app.layout = build_layout()
 # ================= Callbacks =================
 
 @app.callback(
+    Output("root-msgtype-select", "options"),
+    Input("root-system-select", "value"),
+    prevent_initial_call=False
+)
+def update_msgtype_options(selected_system):
+    """根据选择的业务系统名更新交易码下拉框选项"""
+    if selected_system is None or selected_system == '':
+        # 如果未选择系统，显示所有交易码
+        return [{'label': msg, 'value': msg} for msg in ALL_MSGTYPES]
+    else:
+        # 如果选择了系统，显示该系统对应的交易码
+        msgtypes = SYSTEM_TO_MSGTYPES.get(selected_system, set())
+        return [{'label': msg, 'value': msg} for msg in sorted(msgtypes)]
+
+
+@app.callback(
     Output("root-table", "data"),
     Output("root-table", "selectedRowKeys"),
     Output("btn-query", "loading"),
@@ -468,9 +731,11 @@ app.layout = build_layout()
     State("picker-range", "value"),
     State("left-offset", "value"),
     State("right-offset", "value"),
+    State("root-system-select", "value"),
+    State("root-msgtype-select", "value"),
     prevent_initial_call=True
 )
-def on_query(n_clicks, date_range, left_offset, right_offset):
+def on_query(n_clicks, date_range, left_offset, right_offset, selected_system, selected_msgtype):
     if date_range and len(date_range) == 2:
         start = date_range[0]
         end = date_range[1]
@@ -490,7 +755,17 @@ def on_query(n_clicks, date_range, left_offset, right_offset):
         cached["root_df"] = pd.DataFrame()
         return [], [], False
 
-    root_conditions = load_root_conditions()
+    # 根据选择的条件确定要使用的 root_conditions
+    if selected_system and selected_msgtype:
+        # 如果同时选择了系统和交易码，只使用这个条件
+        root_conditions = [(selected_system, selected_msgtype)]
+    elif selected_system:
+        # 如果只选择了系统，使用该系统下的所有交易码
+        root_conditions = [(selected_system, msg) for msg in SYSTEM_TO_MSGTYPES.get(selected_system, [])]
+    else:
+        # 如果都没选择，使用所有 root_conditions
+        root_conditions = ROOT_CONDITIONS
+
     if not root_conditions:
         root_df = pd.DataFrame()
     else:
@@ -529,20 +804,36 @@ def on_query(n_clicks, date_range, left_offset, right_offset):
     # 按 start_at_ms 从小到大排序
     root_df = root_df.sort_values(by='start_at_ms', ascending=True).reset_index(drop=True)
     # 优化：使用向量化操作替代 apply，大幅提升性能
-    # 将毫秒时间戳转换为 datetime 对象（向量化）
-    start_times = pd.to_datetime(root_df['start_at_ms'], unit='ms', errors='coerce')
+    # 将毫秒时间戳转换为 datetime 对象（向量化），考虑时区（UTC+8）
+    # 时间戳是 UTC 时间，需要加上8小时转换为中国时区
+    start_times = pd.to_datetime(root_df['start_at_ms'], unit='ms', errors='coerce', utc=True)
+    # 转换为 UTC+8 时区（使用 dt.tz_convert 因为 start_times 是 Series）
+    start_times = start_times.dt.tz_convert('Asia/Shanghai')
     # 格式化为字符串（向量化）：日期时间部分 + 毫秒部分
     milliseconds = (root_df['start_at_ms'] % 1000).astype(int).astype(str).str.zfill(3)
     root_df['start_time'] = start_times.dt.strftime('%Y-%m-%d %H:%M:%S') + '.' + milliseconds
 
     display_cols = ['index', 'srcSysname', 'dstSysname', 'msgType', 'global_id', 'start_time', 'start_at_ms', 'end_at_ms', 'latency_msec', 'r_src_ip', 'r_dst_ip']
     cached["root_df"] = root_df[display_cols]
-    print(root_df)
+    # 打印命中的交易码统计
+    try:
+        hit_stats = (
+            root_df[['root_system', 'root_msgType']]
+            .value_counts()
+            .reset_index(name='count')
+        )
+        logger.info("命中的重点交易码：")
+        for _, row in hit_stats.iterrows():
+            logger.info(f"  {row['root_system']} {row['root_msgType']} -> {row['count']} 条")
+    except Exception as e:
+        logger.warning(f"打印命中的交易码统计失败: {e}")
+
     return root_df[display_cols].to_dict('records'), [], False
 
 
 @app.callback(
     Output("downstream-table", "data"),
+    Output("downstream-graph", "srcDoc"),
     Input("root-table", "selectedRowKeys"),
     Input("relation-type-checkbox", "value"),
     Input("max-down-steps-input", "value"),
@@ -552,7 +843,7 @@ def on_build_trace(selected_keys, relation_types, max_down_steps):
     df = cached.get("df", pd.DataFrame())
     root_df = cached.get("root_df", pd.DataFrame())
     if not selected_keys or df.empty or root_df.empty:
-        return []
+        return [], ""
 
     # feffery_antd_table 默认 rowKey 为行序号，因此 selected_keys 是行号
     row_pos = int(selected_keys[0])
@@ -562,7 +853,28 @@ def on_build_trace(selected_keys, relation_types, max_down_steps):
     try:
         start_index = int(root_df.iloc[row_pos]['index'])
     except Exception:
-        return []
+        return [], ""
+    # ii = 0
+    # for i in range(len(root_df)):
+    #     start_index = int(root_df.iloc[i]['index'])
+    #
+    #     use_msgtype = relation_types and ('msgType' in relation_types)
+    #     use_gid = relation_types and ('global_id' in relation_types)
+    #
+    #     result_df = build_downstream_trace(
+    #         df=df.copy(),
+    #         start_index=start_index,
+    #         left_offset=cached.get("left_offset", 0),
+    #         right_offset=cached.get("right_offset", 0),
+    #         use_msgtype=use_msgtype,
+    #         use_gid=use_gid,
+    #         max_down_steps=max_down_steps if max_down_steps is not None else -1
+    #     )
+    #
+    #     if len(result_df) > 1:
+    #         ii += 1
+    #     if (len(result_df) > 1) and (len(result_df) < 4):
+    #         a = 1
 
     use_msgtype = relation_types and ('msgType' in relation_types)
     use_gid = relation_types and ('global_id' in relation_types)
@@ -578,7 +890,17 @@ def on_build_trace(selected_keys, relation_types, max_down_steps):
     )
 
     if result_df.empty:
-        return []
+        return [], ""
+
+    # 构建 mermaid 图（使用转换前的原始数据）
+    raw_rows = result_df.to_dict('records')
+    mermaid_text, nodes_data, edges_data = build_mermaid_from_downstream(raw_rows, start_index)
+    html_doc = build_html_doc_downstream(
+        mermaid_text,
+        nodes_data,
+        edges_data,
+        title=f"起始 index {start_index}"
+    )
 
     # 获取表中所有节点的 index 集合
     table_indices = set(result_df['index'].tolist())
@@ -599,7 +921,7 @@ def on_build_trace(selected_keys, relation_types, max_down_steps):
     
     return result_df[['step', 'index', 'msgType', 'global_id', 'srcSysname', 'dstSysname',
                       'start_at_ms', 'end_at_ms', 'latency_msec', 'r_src_ip', 'r_dst_ip', 
-                      '候选父节点', '候选父节点_表中', '候选子节点']].to_dict('records')
+                      '候选父节点', '候选父节点_表中', '候选子节点']].to_dict('records'), html_doc
 
 
 if __name__ == "__main__":

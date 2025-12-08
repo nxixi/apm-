@@ -657,8 +657,27 @@ def on_query(n_clicks, date_range, left_offset, right_offset):
     link_time = round(t2-t1,1)
     global_id_rate = round(len(df[~df['global_id'].isna()])/len(df) * 100, 1)
     global_id_nums = len(df['global_id'].unique())
-    df['候选父节点'] = df['候选父节点'].apply(lambda x: ','.join([str(i) for i in x]))
-    df['候选父节点_msg过滤'] = df['候选父节点_msg过滤'].apply(lambda x: ','.join([str(i) for i in x]))
+    
+    def convert_to_string(x):
+        """将列表转换为字符串，处理各种边界情况"""
+        if x is None or (isinstance(x, (list, tuple)) and len(x) == 0):
+            return ''
+        if isinstance(x, str):
+            # 如果已经是字符串，直接返回
+            return x
+        if isinstance(x, (list, tuple)):
+            # 展平嵌套列表
+            result = []
+            for i in x:
+                if isinstance(i, (list, tuple)):
+                    result.extend([str(j) for j in i])
+                else:
+                    result.append(str(i))
+            return ','.join(result)
+        return str(x)
+    
+    df['候选父节点'] = df['候选父节点'].apply(convert_to_string)
+    df['候选父节点_msg过滤'] = df['候选父节点_msg过滤'].apply(convert_to_string)
     return df[:1000].to_dict('records'), False, f"查询数据：{data_nums}条", f"查询耗时：{data_time}秒", f"串联链路：{link_nums}条", f"串联耗时：{link_time}秒",f"global_id覆盖率: {global_id_rate}%",f"global_id数量: {global_id_nums}"
 # ,msgTypes,msgTypes[0]
 
@@ -675,9 +694,20 @@ def on_query(trace_id):
     try:
         trace_id = int(trace_id)
         df = cached["df"]
-        trace_df = df[df['trace_id']==int(trace_id)]
-        trace_df['候选父节点'] = trace_df['候选父节点'].apply(lambda x: ','.join([str(i) for i in x]))
-        trace_df['候选父节点_msg过滤'] = trace_df['候选父节点_msg过滤'].apply(lambda x: ','.join([str(i) for i in x]))
+        trace_df = df[df['trace_id']==int(trace_id)].copy()
+        
+        # 检查列的数据类型，只有在是列表类型时才转换
+        # 如果已经是字符串，说明在第 660 行已经转换过了，不需要再次转换
+        if len(trace_df) > 0:
+            first_val = trace_df['候选父节点'].iloc[0]
+            if isinstance(first_val, (list, tuple)):
+                # 只有在是列表时才转换
+                trace_df['候选父节点'] = trace_df['候选父节点'].apply(lambda x: ','.join([str(i) for i in x]) if isinstance(x, (list, tuple)) and len(x) > 0 else '')
+            
+            first_val_msg = trace_df['候选父节点_msg过滤'].iloc[0]
+            if isinstance(first_val_msg, (list, tuple)):
+                # 只有在是列表时才转换
+                trace_df['候选父节点_msg过滤'] = trace_df['候选父节点_msg过滤'].apply(lambda x: ','.join([str(i) for i in x]) if isinstance(x, (list, tuple)) and len(x) > 0 else '')
         logger.info(f"{trace_id}: {len(trace_df)}")
         trace_rows = trace_df.to_dict('records')
         html_text = build_mermaid_from_rows(trace_rows)
