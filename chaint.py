@@ -256,7 +256,21 @@ def build_html_doc(mermaid_text: str, trace_id: int) -> str:
 """
 
 
-def build_html_doc_system(mermaid_text: str, sysname: str, start, end, trace_length) -> str:
+def build_html_doc_system(mermaid_text: str, sysname: str, start, end, trace_length, start_nodes: list = None) -> str:
+    """
+    构建 HTML 文档，支持高亮起始节点
+    
+    参数:
+        mermaid_text: Mermaid 图文本
+        sysname: 系统名称
+        start: 开始时间
+        end: 结束时间
+        trace_length: 链路数量
+        start_nodes: 起始节点列表，用于高亮显示
+    """
+    # 将起始节点列表转换为 JSON 字符串
+    start_nodes_json = json.dumps(start_nodes if start_nodes else [])
+    
     return f"""
 <!DOCTYPE html>
 <html lang=\"zh-CN\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
@@ -273,12 +287,34 @@ def build_html_doc_system(mermaid_text: str, sysname: str, start, end, trace_len
   .mermaid svg .edgePath path {{ stroke:#334155; stroke-width:1.8; }}
   .mermaid svg .edgeLabel .label rect {{ fill:#ffffff; stroke:#cbd5e1; }}
   .mermaid svg .edgeLabel .label text {{ fill:#0f172a; font-weight:600; }}
+  /* 起始节点高亮样式 */
+  .mermaid svg .node.start-node rect {{ fill: #fef3c7 !important; stroke: #f59e0b !important; stroke-width: 2.2px !important; }}
+  .mermaid svg .node.start-node text {{ fill: #92400e !important; font-weight: 700 !important; }}
 </style>
 </head><body>
 <div class=\"container\"><div class=\"card\"><div class=\"title\">  {sysname}({start} ~ {end[-8:]}, {trace_length}个Trace) </div>
 <div class=\"mermaid\">{mermaid_text}</div></div></div>
 <script src="/assets/mermaid.min.js"></script>
-<script>mermaid.initialize({{startOnLoad:true,theme:'default',securityLevel:'loose',flowchart:{{curve:'basis',rankSpacing:120,nodeSpacing:70}}}});</script>
+<script>
+  const startNodes = {start_nodes_json};
+  
+  mermaid.initialize({{startOnLoad:true,theme:'default',securityLevel:'loose',flowchart:{{curve:'basis',rankSpacing:120,nodeSpacing:70}}}});
+  
+  // 等待 Mermaid 渲染完成后高亮起始节点
+  setTimeout(() => {{
+    if (startNodes && startNodes.length > 0) {{
+      document.querySelectorAll('.node').forEach(node => {{
+        // 获取节点文本内容
+        const nodeText = node.textContent.trim();
+        
+        // 检查是否是起始节点（匹配节点标签）
+        if (startNodes.includes(nodeText)) {{
+          node.classList.add('start-node');
+        }}
+      }});
+    }}
+  }}, 800);
+</script>
 </body></html>
 """
 
@@ -1003,7 +1039,16 @@ def on_query(n_clicks, selected_system, selected_msgType):
         # 构建聚合 Mermaid 图和 HTML 文档
         mermaid_text = build_mermaid_from_rows(agg_trace_rows)
         title = f"{selected_system} - {selected_msgType} (聚合)"
-        html_doc = build_html_doc_system(mermaid_text, title, start, end, total_chains)
+        
+        # 获取起始节点列表（从第一个匹配的图结构中获取）
+        start_nodes = []
+        if not matching_graphs.empty and '起始节点' in matching_graphs.columns:
+            first_graph = matching_graphs.iloc[0]
+            start_nodes = first_graph.get('起始节点', [])
+            if pd.isna(start_nodes) or start_nodes == '':
+                start_nodes = []
+        
+        html_doc = build_html_doc_system(mermaid_text, title, start, end, total_chains, start_nodes=start_nodes)
         
         stats_text = f"图结构统计: {total_graphs}个结构, {total_chains}条链路"
         return html_doc, stats_text, select_options, False, None
@@ -1109,7 +1154,13 @@ def on_graph_structure_select(selected_graph_id):
         # 构建 Mermaid 图
         mermaid_text = build_mermaid_from_rows(agg_trace_rows)
         title = f"图结构 #{selected_graph_id}"
-        html_doc = build_html_doc_system(mermaid_text, title, start, end, chain_count)
+        
+        # 获取起始节点列表
+        start_nodes = selected_row.get('起始节点', [])
+        if pd.isna(start_nodes) or start_nodes == '':
+            start_nodes = []
+        
+        html_doc = build_html_doc_system(mermaid_text, title, start, end, chain_count, start_nodes=start_nodes)
         
         return html_doc
     

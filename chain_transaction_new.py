@@ -714,7 +714,7 @@ def chain_df(
     right_ms: int = 0,
     use_filtered='msg',
     output_prefix=None,
-    discard_mode='branch',
+    discard_mode='chain',
     candidate_method: str = "downstream",   # 可选：heap, downstream
 ) -> pd.DataFrame:
     """

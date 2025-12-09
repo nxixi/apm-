@@ -10,7 +10,7 @@
 
 import pandas as pd
 from typing import List, Dict, Set, Tuple
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, deque
 import time
 
 
@@ -329,6 +329,248 @@ class ChainTracer:
         
         return index_to_depth, total_discarded, False
     
+    def trace_bidirectional(self, start_node_idx: int, max_depth: int = 100) -> List[int]:
+        """
+        双向追踪核心算法 (BFS)，不使用 self.index_to_gid 结构，
+        直接从 self.index_to_row 中获取 Global ID 并判断唯一性。
+        当 max_depth 为 -1 时，不限制搜索深度。
+        
+        参数:
+            start_node_idx: 起始节点 index
+            max_depth: 最大深度，-1 表示无限制
+        
+        返回:
+            component_nodes: 连通组件中的所有节点 index 列表，如果链路无效则返回 None
+        """
+        # 队列中存储 (节点 index, 当前跳数)
+        queue = deque([(start_node_idx, 0)])
+        component_nodes = []
+        seen_indices = {start_node_idx: 0}
+        seen_gids = set()  # 收集 Global ID
+
+        # 预先设定不限制深度标志
+        no_depth_limit = (max_depth == -1)
+
+        # --- 初始节点检查 ---
+        start_row = self.index_to_row.get(start_node_idx)
+        if not start_row:
+            return None  # 起始节点不存在
+        
+        # 检查起始节点的父节点数量（如果起始节点有多个父节点，整条链路作废）
+        start_parents = self.index_to_parents.get(start_node_idx, [])
+        if len(start_parents) > 1:
+            return None  # 起始节点有多个父节点，整条链路作废
+        
+        start_gid = start_row.get('global_id')
+        if pd.notna(start_gid) and start_gid != '':
+            seen_gids.add(start_gid)
+
+        while queue:
+            curr_idx, curr_hop = queue.popleft()
+
+            # 深度限制检查 (仅在 no_depth_limit 为 False 时执行)
+            if not no_depth_limit and curr_hop >= max_depth:
+                continue
+
+            # 将当前节点加入链路（父节点数量已在加入队列前检查过）
+            component_nodes.append(curr_idx)
+
+            # --- 扩展邻居 (双向) ---
+            children = self.index_to_children.get(curr_idx, [])
+            parents = self.index_to_parents.get(curr_idx, [])
+            
+            # 合并邻居节点，先处理子节点，再处理父节点
+            neighbors = list(children) + list(parents)
+            next_hop = curr_hop + 1
+
+            # 下一跳深度限制检查 (仅在 no_depth_limit 为 False 时执行)
+            should_continue = no_depth_limit or (next_hop < max_depth)
+
+            for neighbor_idx in neighbors:
+                # 跳过已访问的节点
+                if neighbor_idx in seen_indices:
+                    continue
+                
+                # 深度限制检查
+                if not should_continue:
+                    continue
+
+                neighbor_row = self.index_to_row.get(neighbor_idx)
+                if not neighbor_row:
+                    continue  # 节点不存在，跳过
+
+                # --- 规则校验 1: 单父节点校验（无论向上还是向下，都要检查）---
+                # 每个节点加入链路前都要检查其父节点数量
+                # 如果节点的候选父节点数量大于1，整条链路都删除
+                neighbor_parents = self.index_to_parents.get(neighbor_idx, [])
+                if len(neighbor_parents) > 1:
+                    # 根据 discard_mode 决定是整条链路作废还是只跳过该节点
+                    if self.discard_mode == 'chain':
+                        return None  # 整条链路作废
+                    else:
+                        continue  # 只跳过这个节点
+
+                # --- 规则校验 2: Global ID 一致性 ---
+                nid_gid = neighbor_row.get('global_id')
+                if pd.notna(nid_gid) and nid_gid != '':
+                    if len(seen_gids) > 0 and nid_gid not in seen_gids:
+                        return None  # GID 冲突（>1种），整条链路作废
+                    seen_gids.add(nid_gid)
+
+                # 标记并入队
+                # 注意：父节点可以有多个子节点，所有子节点都会继续追踪（不需要检查子节点数量）
+                seen_indices[neighbor_idx] = next_hop
+                queue.append((neighbor_idx, next_hop))
+
+        return component_nodes
+
+    def find_all_bidirectional_chains(
+            self,
+            root_conditions: List[Tuple[str, str]] = None,
+            max_depth: int = 100
+    ) -> Tuple[pd.DataFrame, Dict]:
+        """
+        全量双向追踪入口
+        
+        参数:
+            root_conditions: 入口筛选条件 [(系统, 交易码), ...]，如果为 None 则使用所有节点
+            max_depth: 允许的最大跳数 (hops)，-1 表示无限制
+        
+        返回:
+            (chains_df, stats)
+            - chains_df: 完整链路数据 DataFrame，包含 trace_id
+            - stats: 统计信息字典
+        """
+        start_time = time.time()
+
+        # 1. 确定入口节点
+        if root_conditions:
+            root_nodes_list = []
+            root_conditions_map = {}  # index -> (系统名, 交易码)
+            
+            for root_system, root_msg_type in root_conditions:
+                nodes = self.df[
+                    (self.df['srcSysname'] == root_system + '-F5') &
+                    (self.df['msgType'] == root_msg_type)
+                ]
+                
+                # 记录每个节点的起始条件
+                for node_idx in nodes['index'].values:
+                    root_conditions_map[node_idx] = (root_system, root_msg_type)
+                
+                root_nodes_list.append(nodes)
+            
+            if root_nodes_list:
+                entry_nodes = pd.concat(root_nodes_list, ignore_index=True)
+                candidate_indices = entry_nodes['index'].unique()
+            else:
+                entry_nodes = pd.DataFrame()
+                candidate_indices = []
+        else:
+            entry_nodes = self.df
+            candidate_indices = self.df['index'].values
+            root_conditions_map = {}
+
+        print(f"\n待处理入口节点数: {len(candidate_indices)}")
+        print(f"最大追踪跳数 (Max Depth): {max_depth if max_depth != -1 else '无限制'}")
+
+        if len(candidate_indices) == 0:
+            print("警告：没有找到符合条件的起始节点")
+            return pd.DataFrame(), {}
+
+        global_visited = set()
+        all_chain_dfs = []
+        stats = {
+            '起始节点数量': len(candidate_indices),
+            '有效链路数量': 0,
+            '被抛弃的路径': 0,
+            '过滤的链路（global_id>1种）': 0,
+            '总路径数': 0,
+            '抛弃率': '0%',
+            '抛弃模式': '整条链路' if self.discard_mode == 'chain' else '分支路径',
+            '耗时': ''
+        }
+
+        trace_id_counter = 0
+
+        n_roots = len(candidate_indices)
+        print_interval = max(1, n_roots // 10)  # 每10%显示一次
+
+        for idx, start_idx in enumerate(candidate_indices):
+            if (idx + 1) % print_interval == 0 or (idx + 1) == n_roots:
+                print(f"  进度: {idx + 1}/{n_roots} ({(idx + 1)*100//n_roots}%)")
+            
+            if start_idx in global_visited:
+                continue
+
+            # 2. 执行双向追踪
+            chain_indices = self.trace_bidirectional(start_idx, max_depth=max_depth)
+
+            if chain_indices:
+                # 获取该节点的起始条件
+                root_condition = root_conditions_map.get(start_idx, ('UNKNOWN', 'UNKNOWN'))
+                
+                rows = []
+                for chain_idx in chain_indices:
+                    row_data = self.index_to_row[chain_idx].copy()
+                    row_data['trace_id'] = trace_id_counter
+                    if root_condition:
+                        row_data['root_system'] = root_condition[0]
+                        row_data['root_msgType'] = root_condition[1]
+                    rows.append(row_data)
+
+                all_chain_dfs.append(pd.DataFrame(rows))
+
+                global_visited.update(chain_indices)
+                trace_id_counter += 1
+                stats['有效链路数量'] += 1
+            else:
+                stats['被抛弃的路径'] += 1
+
+        # 合并所有链路 DataFrame
+        if all_chain_dfs:
+            all_chains_df = pd.concat(all_chain_dfs, ignore_index=True)
+            n_unique_chains_before = all_chains_df['trace_id'].nunique()
+            
+            # 检查每个 trace_id 的 global_id 情况（双重检查，虽然 trace_bidirectional 已经检查过）
+            valid_trace_ids = []
+            for trace_id in all_chains_df['trace_id'].unique():
+                trace_data = all_chains_df[all_chains_df['trace_id'] == trace_id]
+                global_ids = trace_data['global_id'].dropna().unique()
+                
+                if len(global_ids) <= 1:
+                    valid_trace_ids.append(trace_id)
+            
+            # 过滤掉 global_id 超过一种的链路
+            if valid_trace_ids:
+                all_chains_df = all_chains_df[all_chains_df['trace_id'].isin(valid_trace_ids)]
+                n_unique_chains = len(valid_trace_ids)
+            else:
+                all_chains_df = pd.DataFrame()
+                n_unique_chains = 0
+            
+            filtered_count = n_unique_chains_before - n_unique_chains
+            stats['过滤的链路（global_id>1种）'] = filtered_count
+        else:
+            all_chains_df = pd.DataFrame()
+            n_unique_chains = 0
+            filtered_count = 0
+
+        elapsed = time.time() - start_time
+        total_paths = n_unique_chains + stats['被抛弃的路径'] + filtered_count
+        stats['总路径数'] = total_paths
+        stats['抛弃率'] = f"{(stats['被抛弃的路径'] + filtered_count)/total_paths*100:.2f}%" if total_paths > 0 else "0%"
+        stats['耗时'] = f"{elapsed:.2f}秒"
+
+        print(f"\n双向追踪完成（抛弃模式: {stats['抛弃模式']}）：")
+        print(f"  - 有效链路: {stats['有效链路数量']}")
+        print(f"  - 被抛弃: {stats['被抛弃的路径']}")
+        print(f"  - 过滤（global_id>1种）: {stats['过滤的链路（global_id>1种）']}")
+        print(f"  - 抛弃率: {stats['抛弃率']}")
+        print(f"  - 耗时: {stats['耗时']}")
+
+        return all_chains_df, stats
+    
     def extract_single_chain_graph(self, chains_df: pd.DataFrame, trace_id: int) -> Dict:
         """
         从单个链路提取图结构
@@ -341,25 +583,57 @@ class ChainTracer:
             图结构字典，包含:
             - nodes: 节点列表 [node_name, ...]
             - edges: 边列表 [{'source': src, 'target': dst, 'msgType': msg}, ...]
+            - start_nodes: 起始节点列表 [node_name, ...]
         """
         # 筛选指定 trace_id 的数据
         chain_data = chains_df[chains_df['trace_id'] == trace_id]
         
         if chain_data.empty:
-            return {'nodes': [], 'edges': []}
+            return {'nodes': [], 'edges': [], 'start_nodes': []}
         
         nodes = set()
         edges_set = set()  # 使用集合去重
+        start_nodes = set()  # 起始节点集合
+        
+        # 识别起始节点：depth=1 或 depth=0（双向追踪时）
+        # 如果没有 depth 字段，则根据 root_system 和 root_msgType 判断
+        has_depth = 'depth' in chain_data.columns
+        has_root_info = 'root_system' in chain_data.columns and 'root_msgType' in chain_data.columns
+        
+        if has_depth:
+            # 找到最小 depth 的节点作为起始节点
+            min_depth = chain_data['depth'].min()
+            start_rows = chain_data[chain_data['depth'] == min_depth]
+        elif has_root_info:
+            # 根据 root_system 和 root_msgType 判断起始节点
+            # 起始节点应该是 srcSysname == root_system + '-F5' 且 msgType == root_msgType
+            root_system = chain_data.iloc[0]['root_system']
+            root_msgType = chain_data.iloc[0]['root_msgType']
+            if pd.notna(root_system) and pd.notna(root_msgType):
+                start_rows = chain_data[
+                    (chain_data['srcSysname'] == str(root_system) + '-F5') &
+                    (chain_data['msgType'] == str(root_msgType))
+                ]
+            else:
+                start_rows = chain_data.iloc[:1]  # 如果没有 root 信息，使用第一行
+        else:
+            # 默认使用第一行作为起始节点
+            start_rows = chain_data.iloc[:1]
         
         # 遍历每行数据，提取节点和边
         for i, row in chain_data.iterrows():
-            src = row['srcSysname']
-            dst = row['dstSysname']
-            msg_type = row['msgType']
+            # 转换为字符串，处理 NaN 值
+            src = str(row['srcSysname']) if pd.notna(row['srcSysname']) else 'None'
+            dst = str(row['dstSysname']) if pd.notna(row['dstSysname']) else 'None'
+            msg_type = str(row['msgType']) if pd.notna(row['msgType']) else 'None'
             
             # 添加节点
             nodes.add(src)
             nodes.add(dst)
+            
+            # 判断是否为起始节点（起始节点的源系统）
+            if not start_rows.empty and i in start_rows.index:
+                start_nodes.add(src)
             
             # 添加边（使用元组去重）
             edges_set.add((src, dst, msg_type))
@@ -371,8 +645,9 @@ class ChainTracer:
         ]
         
         return {
-            'nodes': sorted(list(nodes)),  # 排序后返回列表
-            'edges': edges
+            'nodes': sorted(list([str(i) for i in nodes])),  # 排序后返回列表
+            'edges': edges,
+            'start_nodes': sorted(list([str(i) for i in start_nodes]))  # 起始节点列表
         }
     
     def count_graph_structures(self, chains_df: pd.DataFrame) -> pd.DataFrame:
@@ -400,8 +675,15 @@ class ChainTracer:
             # 节点已经排序
             nodes_str = ",".join(graph['nodes'])
             
-            # 对边排序（按 source, target, msgType）
-            edges_sorted = sorted(graph['edges'], key=lambda x: (x['source'], x['target'], x['msgType']))
+            # 对边排序（按 source, target, msgType），确保所有值都是字符串
+            edges_sorted = sorted(
+                graph['edges'], 
+                key=lambda x: (
+                    str(x['source']) if pd.notna(x['source']) else 'None',
+                    str(x['target']) if pd.notna(x['target']) else 'None',
+                    str(x['msgType']) if pd.notna(x['msgType']) else 'None'
+                )
+            )
             edges_str = ";".join([f"{e['source']}->{e['target']}[{e['msgType']}]" for e in edges_sorted])
             
             # 组合成唯一标识
@@ -438,6 +720,10 @@ class ChainTracer:
             # 转换为列表格式
             root_conditions_list = sorted(list(root_conditions))
             
+            # 诊断输出：多个起始节点对应相同图结构
+            if len(root_conditions_list) > 1:
+                print(f"[graph_structures] 同一图结构包含多条链路: graph_id={graph_id}, trace_ids={list(trace_ids)}, root_conditions={root_conditions_list}")
+            
             results.append({
                 'graph_id': graph_id,  # 添加图结构编号
                 '图结构': signature,
@@ -447,7 +733,8 @@ class ChainTracer:
                 'trace_id': [int(tid) for tid in trace_ids],  # 转换为普通 Python int 列表
                 'root_conditions': root_conditions_list,  # 所有起始条件
                 '节点': example_graph['nodes'],
-                '边': example_graph['edges']
+                '边': example_graph['edges'],
+                '起始节点': example_graph.get('start_nodes', [])  # 起始节点列表
             })
             graph_id += 1  # 递增编号
         
@@ -466,7 +753,7 @@ def trace_and_analyze(
     max_depth: int = 100,
     output_prefix: str = None,
     merge_with_input: bool = False,
-    discard_mode: str = 'branch'
+    discard_mode: str = 'chain'
 ) -> Tuple[pd.DataFrame, Dict, pd.DataFrame]:
     """
     一键追踪和分析链路
@@ -503,10 +790,11 @@ def trace_and_analyze(
     tracer = ChainTracer(df, use_filtered=use_filtered, discard_mode=discard_mode)
     
     # 追踪链路，返回 DataFrame
-    chains_df, stats = tracer.find_chains_from_root(
-        root_conditions=root_conditions,
-        max_depth=max_depth
-    )
+    # chains_df, stats = tracer.find_chains_from_root(
+    #     root_conditions=root_conditions,
+    #     max_depth=max_depth
+    # )
+    chains_df, stats = tracer.find_all_bidirectional_chains(root_conditions, max_depth)
     
     if chains_df.empty:
         print("\n没有找到有效链路")
