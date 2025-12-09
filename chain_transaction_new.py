@@ -456,7 +456,12 @@ def estimate_memory_usage(df: pd.DataFrame) -> dict:
     }
 
 
-def chain_df_heap(df: pd.DataFrame, left_ms: int = 0, right_ms: int = 0) -> pd.DataFrame:
+def chain_df_heap(
+    df: pd.DataFrame,
+    left_ms: int = 0,
+    right_ms: int = 0,
+    candidate_method: str = "downstream"   # 可选："heap" 或 "downstream"
+) -> pd.DataFrame:
     """
     堆优化版本：基于原 chain_transaction.py 的堆算法改造
     使用时间排序 + 堆维护活跃父节点，找出所有候选父子节点
@@ -485,7 +490,7 @@ def chain_df_heap(df: pd.DataFrame, left_ms: int = 0, right_ms: int = 0) -> pd.D
     result_df = df.copy()
     n = len(result_df)
     
-    print("【堆优化模式】使用时间排序 + 堆算法")
+    # print("【堆优化模式】使用时间排序 + 堆算法")
     
     # 初始化结果
     children_dict = defaultdict(list)  # {parent_index: [child_indices]}
@@ -501,7 +506,7 @@ def chain_df_heap(df: pd.DataFrame, left_ms: int = 0, right_ms: int = 0) -> pd.D
     src_groups = result_df.groupby(src_ip_col)
     dst_groups = result_df.groupby(dst_ip_col)
     
-    print("查找候选节点（使用堆优化）...")
+    print(f"查找候选节点（方法: {candidate_method}）...")
     # 对每个 IP 对，使用堆算法找所有候选父子关系
     for ip in set(src_groups.groups.keys()).intersection(dst_groups.groups.keys()):
         # 候选父节点：dst_ip == ip
@@ -512,12 +517,19 @@ def chain_df_heap(df: pd.DataFrame, left_ms: int = 0, right_ms: int = 0) -> pd.D
         if len(parent_indices) == 0 or len(child_indices) == 0:
             continue
         
-        # 调用堆算法查找所有候选关系
-        links = _link_all_candidates_heap(
-            parent_indices, child_indices,
-            start_times, end_times, indices_values,
-            left_ms, right_ms
-        )
+        # 根据配置选择算法
+        if candidate_method == "downstream":
+            links = _link_all_candidates_downstream_full(
+                parent_indices, child_indices,
+                start_times, end_times, indices_values,
+                left_ms, right_ms
+            )
+        else:
+            links = _link_all_candidates_heap(
+                parent_indices, child_indices,
+                start_times, end_times, indices_values,
+                left_ms, right_ms
+            )
         
         # 存储结果
         for child_idx, parent_idx in links:
@@ -644,7 +656,67 @@ def _link_all_candidates_heap(
     return links
 
 
-def chain_df(df: pd.DataFrame, left_ms: int = 0, right_ms: int = 0, use_filtered='msg', output_prefix=None, discard_mode='branch') -> pd.DataFrame:
+def _link_all_candidates_downstream_full(
+    parent_indices: np.ndarray,
+    child_indices: np.ndarray,
+    start_times: np.ndarray,
+    end_times: np.ndarray,
+    indices_values: np.ndarray,
+    left_ms: int,
+    right_ms: int
+) -> List[Tuple]:
+    """
+    全量查找父子关系（与 build_downstream_trace 时间/IP 逻辑一致），
+    使用排序 + 二分窗口剪枝，避免 O(P*C) 的完全穷举。
+    条件：parent.start_at_ms - left_ms <= child.start_at_ms 且 parent.end_at_ms + right_ms >= child.end_at_ms
+    """
+    if parent_indices.size == 0 or child_indices.size == 0:
+        return []
+
+    links: List[Tuple] = []
+
+    # 子节点按开始时间排序，便于窗口截取
+    child_pos_sorted = np.argsort(start_times[child_indices], kind="mergesort")
+    C_sorted = child_indices[child_pos_sorted]
+    child_start_sorted = start_times[C_sorted]
+    child_end_sorted = end_times[C_sorted]
+
+    for p_pos in parent_indices:
+        p_start_adj = int(start_times[p_pos]) - left_ms
+        p_end_adj = int(end_times[p_pos]) + right_ms
+
+        # 只需考虑 start >= p_start_adj 的子节点；start > p_end_adj 可提前截断
+        lo = np.searchsorted(child_start_sorted, p_start_adj, side="left")
+        hi = np.searchsorted(child_start_sorted, p_end_adj, side="right")
+        if hi <= lo:
+            continue
+
+        # 在窗口内再按 end 做过滤
+        cand_c = C_sorted[lo:hi]
+        cand_end = child_end_sorted[lo:hi]
+        mask = cand_end <= p_end_adj
+        if not np.any(mask):
+            continue
+
+        valid_children = cand_c[mask]
+        parent_idx_val = int(indices_values[p_pos])
+        for c_pos in valid_children:
+            child_idx_val = int(indices_values[c_pos])
+            if child_idx_val != parent_idx_val:
+                links.append((child_idx_val, parent_idx_val))
+
+    return links
+
+
+def chain_df(
+    df: pd.DataFrame,
+    left_ms: int = 0,
+    right_ms: int = 0,
+    use_filtered='msg',
+    output_prefix=None,
+    discard_mode='branch',
+    candidate_method: str = "downstream",   # 可选：heap, downstream
+) -> pd.DataFrame:
     """
     串联链路并追踪
     
@@ -661,7 +733,12 @@ def chain_df(df: pd.DataFrame, left_ms: int = 0, right_ms: int = 0, use_filtered
     df['end_at_ms'] = df['start_at_ms'] + df["latency_msec"]
 
     # 打上父节点、子节点
-    df_node = chain_df_heap(df, left_ms=left_ms, right_ms=right_ms)
+    df_node = chain_df_heap(
+        df,
+        left_ms=left_ms,
+        right_ms=right_ms,
+        candidate_method=candidate_method
+    )
 
     # 以重要交易码为起点，串联链路
     # 从文本文件读取起始条件

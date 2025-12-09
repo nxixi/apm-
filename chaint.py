@@ -641,7 +641,8 @@ def on_query(n_clicks, date_range, left_offset, right_offset):
     data_nums = len(df)
     data_time = round(t2-t1,1)
     t1 = time.time()
-    df, graph_stats_df = chain_df(df, left_ms=left_ms, right_ms=right_ms, output_prefix="chain_analysis", discard_mode='chain')
+    df, graph_stats_df = chain_df(df, left_ms=left_ms, right_ms=right_ms, output_prefix="chain_analysis",
+                                  discard_mode='chain', candidate_method='downstream')
     df['msgType'] = df['msgType'].fillna('None')
     #logger.info(list(df['msgType'].unique()))
     msgTypes = list(df['msgType'].unique())

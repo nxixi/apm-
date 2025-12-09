@@ -340,6 +340,229 @@ def build_downstream_trace(df, start_index, left_offset, right_offset,
     return result_df
 
 
+def _find_children_for_node(current_idx, current_row, window_df, df_for_children, src_groups,
+                            left_offset, right_offset, use_msgtype, use_gid, node_children):
+    """
+    为指定节点查找候选子节点（从全量数据中）
+    条件：child.src_ip == current.dst_ip 且满足时间包含关系
+    """
+    current_dst_ip = str(current_row['r_dst_ip'])
+    child_candidate_indices = src_groups.get(current_dst_ip, [])
+    if child_candidate_indices is None or len(child_candidate_indices) == 0:
+        return
+
+    child_candidate_rows = df_for_children.loc[child_candidate_indices]
+
+    # 检查时间包含关系：父节点的时间范围（考虑 offset）应该包含子节点的时间范围
+    parent_start = int(current_row['start_at_ms'])
+    parent_end = int(current_row['end_at_ms'])
+
+    # 时间过滤：只保留满足时间包含关系的候选子节点
+    time_filtered_children = child_candidate_rows[
+        (child_candidate_rows['start_at_ms'] >= parent_start - (left_offset or 0)) &
+        (child_candidate_rows['end_at_ms'] <= parent_end + (right_offset or 0))
+    ]
+
+    if time_filtered_children.empty:
+        return
+
+    # 进一步应用 msgType 和 global_id 过滤
+    for child_idx, child_row in time_filtered_children.iterrows():
+        if child_idx == current_idx:
+            continue
+
+        # 检查 msgType 和 global_id 过滤
+        parent_msg = current_row.get('msgType')
+        parent_gid = current_row.get('global_id')
+        parent_gid = parent_gid if pd.notna(parent_gid) else None
+        child_msg = child_row.get('msgType')
+        child_gid = child_row.get('global_id')
+        child_gid = child_gid if pd.notna(child_gid) else None
+
+        # msgType 过滤（ESB/F5 结构）
+        if use_msgtype and esb_requires_same_msg(current_row, child_row):
+            if not (pd.isna(parent_msg) or pd.isna(child_msg)) and parent_msg != child_msg:
+                continue
+
+        # global_id 过滤
+        if use_gid and parent_gid is not None and child_gid is not None and parent_gid != child_gid:
+            continue
+
+        # 添加到候选子节点列表
+        if int(child_idx) not in node_children.get(current_idx, []):
+            if current_idx not in node_children:
+                node_children[current_idx] = []
+            node_children[current_idx].append(int(child_idx))
+
+
+def build_bidirectional_trace(df, start_index, left_offset, right_offset,
+                              use_msgtype=False, use_gid=False, max_down_steps=-1, max_up_steps=-1):
+    """
+    双向追踪：同时向上和向下追踪
+    向上追踪：从起始节点向上找父节点
+    向下追踪：从起始节点向下找子节点
+    """
+    if df.empty or start_index not in df['index'].values:
+        return pd.DataFrame()
+
+    start_row = df[df['index'] == start_index].iloc[0]
+    start_time = int(start_row['start_at_ms']) - (left_offset or 0)
+    end_time = int(start_row['end_at_ms']) + (right_offset or 0)
+
+    # 扩展时间窗口以包含向上追踪的节点（父节点可能在时间窗口之前）
+    window_df = df[(df['start_at_ms'] >= start_time - (left_offset or 0)) &
+                   (df['end_at_ms'] <= end_time + (right_offset or 0))].copy()
+    if window_df.empty:
+        return pd.DataFrame()
+
+    window_df = window_df.sort_values(by='start_at_ms')
+    window_df.set_index('index', inplace=True)
+
+    # 构建全量数据的 IP 索引
+    df_for_trace = df.copy()
+    df_for_trace.set_index('index', inplace=True)
+    src_groups = df_for_trace.groupby('r_src_ip').groups  # 用于向下追踪：通过 dst_ip 找子节点
+    dst_groups = df_for_trace.groupby('r_dst_ip').groups  # 用于向上追踪：通过 src_ip 找父节点
+
+    visited = set()
+    # 使用两个队列：一个向下，一个向上
+    down_queue = deque([(start_index, 0)])  # (index, depth)，depth >= 0 表示向下
+    up_queue = deque([(start_index, 0)])    # (index, depth)，从起始节点开始向上追踪
+    visited.add(start_index)
+
+    node_children = defaultdict(list)
+    node_parents = defaultdict(list)
+    node_steps = {start_index: 0}  # 起始节点步数为0
+
+    # 先处理向上追踪
+    while up_queue:
+        current_idx, depth = up_queue.popleft()
+
+        # 如果节点不在 window_df 中，从 df_for_trace 获取（向上追踪的节点可能在时间窗口之前）
+        if current_idx not in window_df.index:
+            if current_idx not in df_for_trace.index:
+                continue
+            current_row = df_for_trace.loc[current_idx]
+        else:
+            current_row = window_df.loc[current_idx]
+
+        # 步长限制（向上追踪的 depth 是负数，取绝对值）
+        up_depth = abs(depth) if depth < 0 else 0
+        if max_up_steps is not None and max_up_steps >= 0 and up_depth >= max_up_steps:
+            continue
+
+        # 为当前节点查找候选父节点
+        _find_parents_for_node(current_idx, current_row, window_df, df_for_trace, dst_groups,
+                              left_offset, right_offset, use_msgtype, use_gid, node_parents)
+
+        # 获取找到的父节点并继续向上追踪
+        parent_indices = node_parents.get(current_idx, [])
+        for parent_idx in parent_indices:
+            if parent_idx not in visited:
+                visited.add(parent_idx)
+                # 向上追踪的 depth 是负数：-1, -2, -3...
+                new_depth = (depth - 1) if depth < 0 else -1
+                node_steps[parent_idx] = new_depth
+                up_queue.append((parent_idx, new_depth))
+
+    # 再处理向下追踪
+    while down_queue:
+        current_idx, depth = down_queue.popleft()
+        if current_idx not in window_df.index:
+            continue
+
+        current_row = window_df.loc[current_idx]
+
+        # 步长限制
+        if max_down_steps is not None and max_down_steps >= 0 and depth >= max_down_steps:
+            # 即使达到步长限制，也要查找候选父节点和子节点（用于记录关系）
+            _find_parents_for_node(current_idx, current_row, window_df, df_for_trace, dst_groups,
+                                  left_offset, right_offset, use_msgtype, use_gid, node_parents)
+            _find_children_for_node(current_idx, current_row, window_df, df_for_trace, src_groups,
+                                   left_offset, right_offset, use_msgtype, use_gid, node_children)
+            continue
+
+        # 为当前节点查找候选子节点
+        candidate_indices = src_groups.get(str(current_row['r_dst_ip']), [])
+        if candidate_indices is None or len(candidate_indices) == 0:
+            # 没有候选子节点（叶子节点），但仍需要查找候选父节点和子节点
+            _find_parents_for_node(current_idx, current_row, window_df, df_for_trace, dst_groups,
+                                  left_offset, right_offset, use_msgtype, use_gid, node_parents)
+            _find_children_for_node(current_idx, current_row, window_df, df_for_trace, src_groups,
+                                   left_offset, right_offset, use_msgtype, use_gid, node_children)
+            continue
+
+        candidate_rows = df_for_trace.loc[candidate_indices]
+
+        # 时间过滤
+        current_start = int(current_row['start_at_ms'])
+        current_end = int(current_row['end_at_ms'])
+        parent_start_lower = current_start - (left_offset or 0)
+        parent_end_upper = current_end + (right_offset or 0)
+
+        time_filtered = candidate_rows[
+            (candidate_rows['start_at_ms'] >= parent_start_lower) &
+            (candidate_rows['end_at_ms'] <= parent_end_upper)
+        ]
+
+        if time_filtered.empty:
+            _find_parents_for_node(current_idx, current_row, window_df, df_for_trace, dst_groups,
+                                  left_offset, right_offset, use_msgtype, use_gid, node_parents)
+            _find_children_for_node(current_idx, current_row, window_df, df_for_trace, src_groups,
+                                   left_offset, right_offset, use_msgtype, use_gid, node_children)
+            continue
+
+        # 进一步应用 msgType 和 global_id 过滤
+        filtered_children = filter_candidates(current_row, time_filtered, use_msgtype, use_gid)
+        if filtered_children.empty:
+            _find_parents_for_node(current_idx, current_row, window_df, df_for_trace, dst_groups,
+                                  left_offset, right_offset, use_msgtype, use_gid, node_parents)
+            _find_children_for_node(current_idx, current_row, window_df, df_for_trace, src_groups,
+                                   left_offset, right_offset, use_msgtype, use_gid, node_children)
+            continue
+
+        # 有子节点的情况：记录子节点并加入队列
+        for child_idx, child_row in filtered_children.iterrows():
+            node_children[current_idx].append(int(child_idx))
+            if child_idx not in visited:
+                visited.add(child_idx)
+                new_depth = depth + 1
+                node_steps[child_idx] = new_depth
+                down_queue.append((int(child_idx), new_depth))
+
+        # 为当前节点查找候选父节点和子节点（用于记录关系）
+        _find_parents_for_node(current_idx, current_row, window_df, df_for_trace, dst_groups,
+                              left_offset, right_offset, use_msgtype, use_gid, node_parents)
+        _find_children_for_node(current_idx, current_row, window_df, df_for_trace, src_groups,
+                               left_offset, right_offset, use_msgtype, use_gid, node_children)
+
+    if not visited:
+        return pd.DataFrame()
+
+    # 确保所有访问的节点都在 window_df 中（可能需要扩展 window_df）
+    missing_indices = visited - set(window_df.index)
+    if missing_indices:
+        missing_df = df_for_trace.loc[list(missing_indices)]
+        window_df = pd.concat([window_df, missing_df])
+
+    result_rows = []
+    for idx in visited:
+        if idx not in window_df.index:
+            continue
+        row = window_df.loc[idx].copy()
+        row_dict = row.to_dict()
+        row_dict['index'] = int(idx)
+        row_dict['step'] = node_steps.get(idx, 0)
+        row_dict['候选子节点'] = node_children.get(idx, [])
+        row_dict['候选父节点'] = node_parents.get(idx, [])
+        result_rows.append(row_dict)
+
+    result_df = pd.DataFrame(result_rows)
+    result_df.sort_values(by=['step', 'start_at_ms'], inplace=True)
+    result_df.reset_index(drop=True, inplace=True)
+    return result_df
+
+
 # ================ Mermaid 图构建 ================
 def _sanitize_id(name: str) -> str:
     """将业务系统名转为 mermaid 可用的节点 id"""
@@ -611,19 +834,18 @@ def build_layout():
     )
 
     trace_controls = fac.AntdSpace([
-        # 查找模式相关组件暂时停用
-        # fac.AntdText("查找模式:", strong=True),
-        # fac.AntdRadioGroup(
-        #     id='trace-type-radio',
-        #     options=[
-        #         {'label': '模式 1 (严格路径)', 'value': '1'},
-        #         {'label': '模式 2 (完整子图)', 'value': '2'}
-        #     ],
-        #     defaultValue='1',
-        #     optionType='button',
-        #     buttonStyle='solid'
-        # ),
-        # fac.AntdDivider(direction='vertical'),
+        fac.AntdText("追踪方向:", strong=True),
+        fac.AntdRadioGroup(
+            id='trace-direction-radio',
+            options=[
+                {'label': '向下追踪', 'value': 'down'},
+                {'label': '双向追踪', 'value': 'bidirectional'}
+            ],
+            defaultValue='down',
+            optionType='button',
+            buttonStyle='solid'
+        ),
+        fac.AntdDivider(direction='vertical'),
         fac.AntdCheckboxGroup(
             id='relation-type-checkbox',
             options=[
@@ -636,6 +858,8 @@ def build_layout():
         fac.AntdDivider(direction='vertical'),
         fac.AntdText("向下步长:", strong=True),
         fac.AntdInputNumber(id='max-down-steps-input', min=-1, value=-1, style={'width': 120}),
+        fac.AntdText("向上步长:", strong=True),
+        fac.AntdInputNumber(id='max-up-steps-input', min=-1, value=-1, style={'width': 120}),
     ], size=8, style={"margin": "12px 0"})
 
     downstream_table = fac.AntdTable(
@@ -837,9 +1061,11 @@ def on_query(n_clicks, date_range, left_offset, right_offset, selected_system, s
     Input("root-table", "selectedRowKeys"),
     Input("relation-type-checkbox", "value"),
     Input("max-down-steps-input", "value"),
+    Input("max-up-steps-input", "value"),
+    Input("trace-direction-radio", "value"),
     prevent_initial_call=True
 )
-def on_build_trace(selected_keys, relation_types, max_down_steps):
+def on_build_trace(selected_keys, relation_types, max_down_steps, max_up_steps, trace_direction):
     df = cached.get("df", pd.DataFrame())
     root_df = cached.get("root_df", pd.DataFrame())
     if not selected_keys or df.empty or root_df.empty:
@@ -854,40 +1080,32 @@ def on_build_trace(selected_keys, relation_types, max_down_steps):
         start_index = int(root_df.iloc[row_pos]['index'])
     except Exception:
         return [], ""
-    # ii = 0
-    # for i in range(len(root_df)):
-    #     start_index = int(root_df.iloc[i]['index'])
-    #
-    #     use_msgtype = relation_types and ('msgType' in relation_types)
-    #     use_gid = relation_types and ('global_id' in relation_types)
-    #
-    #     result_df = build_downstream_trace(
-    #         df=df.copy(),
-    #         start_index=start_index,
-    #         left_offset=cached.get("left_offset", 0),
-    #         right_offset=cached.get("right_offset", 0),
-    #         use_msgtype=use_msgtype,
-    #         use_gid=use_gid,
-    #         max_down_steps=max_down_steps if max_down_steps is not None else -1
-    #     )
-    #
-    #     if len(result_df) > 1:
-    #         ii += 1
-    #     if (len(result_df) > 1) and (len(result_df) < 4):
-    #         a = 1
 
     use_msgtype = relation_types and ('msgType' in relation_types)
     use_gid = relation_types and ('global_id' in relation_types)
 
-    result_df = build_downstream_trace(
-        df=df.copy(),
-        start_index=start_index,
-        left_offset=cached.get("left_offset", 0),
-        right_offset=cached.get("right_offset", 0),
-        use_msgtype=use_msgtype,
-        use_gid=use_gid,
-        max_down_steps=max_down_steps if max_down_steps is not None else -1
-    )
+    # 根据追踪方向选择不同的追踪函数
+    if trace_direction == 'bidirectional':
+        result_df = build_bidirectional_trace(
+            df=df.copy(),
+            start_index=start_index,
+            left_offset=cached.get("left_offset", 0),
+            right_offset=cached.get("right_offset", 0),
+            use_msgtype=use_msgtype,
+            use_gid=use_gid,
+            max_down_steps=max_down_steps if max_down_steps is not None else -1,
+            max_up_steps=max_up_steps if max_up_steps is not None else -1
+        )
+    else:  # 'down' - 向下追踪
+        result_df = build_downstream_trace(
+            df=df.copy(),
+            start_index=start_index,
+            left_offset=cached.get("left_offset", 0),
+            right_offset=cached.get("right_offset", 0),
+            use_msgtype=use_msgtype,
+            use_gid=use_gid,
+            max_down_steps=max_down_steps if max_down_steps is not None else -1
+        )
 
     if result_df.empty:
         return [], ""
@@ -895,11 +1113,14 @@ def on_build_trace(selected_keys, relation_types, max_down_steps):
     # 构建 mermaid 图（使用转换前的原始数据）
     raw_rows = result_df.to_dict('records')
     mermaid_text, nodes_data, edges_data = build_mermaid_from_downstream(raw_rows, start_index)
+
+    # 根据追踪方向设置标题
+    direction_text = "双向追踪" if trace_direction == 'bidirectional' else "向下追踪"
     html_doc = build_html_doc_downstream(
         mermaid_text,
         nodes_data,
         edges_data,
-        title=f"起始 index {start_index}"
+        title=f"{direction_text} - 起始 index {start_index}"
     )
 
     # 获取表中所有节点的 index 集合
