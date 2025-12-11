@@ -458,6 +458,10 @@ def build_bidirectional_trace(df, start_index, left_offset, right_offset,
         # 获取找到的父节点并继续向上追踪
         parent_indices = node_parents.get(current_idx, [])
         for parent_idx in parent_indices:
+            # 记录父->子关系，便于表格展示“候选子节点”
+            if int(current_idx) not in node_children.get(parent_idx, []):
+                node_children[parent_idx].append(int(current_idx))
+
             if parent_idx not in visited:
                 visited.add(parent_idx)
                 # 向上追踪的 depth 是负数：-1, -2, -3...

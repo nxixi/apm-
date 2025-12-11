@@ -722,7 +722,7 @@ class ChainTracer:
             
             # 诊断输出：多个起始节点对应相同图结构
             if len(root_conditions_list) > 1:
-                print(f"[graph_structures] 同一图结构包含多条链路: graph_id={graph_id}, trace_ids={list(trace_ids)}, root_conditions={root_conditions_list}")
+                print(f"[graph_structures] 多个入口节点有相同链路: graph_id={graph_id}, trace_ids={list(trace_ids)}, root_conditions={root_conditions_list}")
             
             results.append({
                 'graph_id': graph_id,  # 添加图结构编号
