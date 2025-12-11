@@ -204,8 +204,9 @@ def search_apm_data(start, end, limit=5000000):
         t6 = time.time()
         logger.info(f"【F5处理】srcSysname为F5的src_ip有：{f5_src_ip}，dstSysname为F5的dst_ip有：{f5_dst_ip}，耗时{round(t6 - t5, 2)}s")
         df = df.sort_values(by='start_at_ms').reset_index(drop=True)
+        df['end_at_ms'] = df['start_at_ms'] + df['latency_msec']
         df["index"] = df.index
-        return df
+        return df[['index', 'global_id', 'msgType', 'start_at_ms', 'end_at_ms', 'latency_msec', 'r_src_ip', 'r_dst_ip', 'srcSysname', 'dstSysname']]
         # else:
         #     logger.warning(f"【数据丰富】未获取到cmdb数据，丰富失败！")
         #     return pd.DataFrame()
@@ -676,22 +677,24 @@ def on_query(n_clicks, date_range, left_offset, right_offset):
     t2 = time.time()
     data_nums = len(df)
     data_time = round(t2-t1,1)
+
     t1 = time.time()
     df, graph_stats_df = chain_df(df, left_ms=left_ms, right_ms=right_ms, output_prefix="chain_analysis",
-                                  discard_mode='chain', candidate_method='downstream')
+                                  discard_mode='chain', candidate_method='base')
+    t2 = time.time()
+    link_nums = len(df['trace_id'].unique())
+    link_time = round(t2-t1,1)
+
     df['msgType'] = df['msgType'].fillna('None')
     #logger.info(list(df['msgType'].unique()))
     msgTypes = list(df['msgType'].unique())
     #msgTypes.remove("")
-    df.to_csv(f"result/PSISADP_test_1117.csv",index=False)
+    # df.to_csv(f"result/PSISADP_test_1117.csv",index=False)
     #logger.info(df['msgType'].unique())
     cached["df"] = df
     cached["graph_stats_df"] = graph_stats_df  # 存储 graph_stats_df
     cached["start"] = start
     cached["end"] = end
-    t2 = time.time()
-    link_nums = len(df['trace_id'].unique())
-    link_time = round(t2-t1,1)
     global_id_rate = round(len(df[~df['global_id'].isna()])/len(df) * 100, 1)
     global_id_nums = len(df['global_id'].unique())
     

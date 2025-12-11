@@ -17,43 +17,28 @@ import time
 class ChainTracer:
     """链路追踪器"""
     
-    def __init__(self, df: pd.DataFrame, use_filtered: str = 'msg', discard_mode: str = 'branch'):
+    def __init__(self, df: pd.DataFrame, discard_mode: str = 'branch'):
         """
         初始化链路追踪器
         
         参数:
             df: 包含候选节点列的 DataFrame
-            use_filtered: 使用哪个过滤列 ('original', 'gid', 'msg')
-                - 'msg': 使用同时满足 global_id 与 ESB/msgType 规则的候选关系
-                        （列：候选子节点_gid_esb过滤 / 候选父节点_gid_esb过滤）
             discard_mode: 抛弃模式
                 - 'branch': 只抛弃该节点及其后续路径（默认，原规则）
                 - 'chain': 抛弃整条链路（包括之前的链路）
         """
         self.df = df
-        self.use_filtered = use_filtered
         self.discard_mode = discard_mode
         
-        # 选择使用哪个候选列
-        if use_filtered == 'msg':
-            # 默认：使用 gid 过滤与 ESB/msgType 规则的交集结果
-            self.children_col = '候选子节点_gid_esb过滤'
-            self.parents_col = '候选父节点_gid_esb过滤'
-        elif use_filtered == 'gid':
-            self.children_col = '候选子节点_gid过滤'
-            self.parents_col = '候选父节点_gid过滤'
-        else:
-            self.children_col = '候选子节点'
-            self.parents_col = '候选父节点'
+        # 使用 gid 过滤与 ESB/msgType 规则的交集结果作为候选列
+        self.children_col = '候选子节点_gid_msg过滤'
+        self.parents_col = '候选父节点_gid_msg过滤'
         
         # 构建快速查找索引
         self._build_indexes()
     
     def _build_indexes(self):
         """构建索引：index -> row, index -> children, index -> parents（优化版本）"""
-        print("构建索引...")
-        
-        # 使用 dict(zip()) 代替 iterrows()，快100倍
         indices = self.df['index'].values
         children_lists = self.df[self.children_col].values
         parents_lists = self.df[self.parents_col].values
@@ -67,19 +52,16 @@ class ChainTracer:
         self.index_to_msgtype = dict(zip(indices, self.df['msgType'].values))
         
         # 预先构建 index -> row_data 映射（优化性能）
-        print("构建行数据映射...")
         all_records = self.df.to_dict('records')
         self.index_to_row = {record['index']: record for record in all_records}
-        
-        print("索引构建完成")
-    
-    def find_chains_from_root(
+
+    def find_chains_backward(
         self, 
         root_conditions: List[Tuple[str, str]],
         max_depth: int = 100
     ) -> Tuple[pd.DataFrame, Dict]:
         """
-        从指定起始节点查找所有有效的完整链路
+        从指定起始节点向后查找所有有效的完整链路
         
         参数:
             root_conditions: 起始节点条件列表 [(系统名, 交易码), ...]
@@ -90,15 +72,11 @@ class ChainTracer:
             - valid_chains: 有效链路列表，每条链路是 [(系统, 交易码), ...] 的列表
             - stats: 统计信息字典
         """
-        # print(f"\n{'='*80}")
-        # print(f"开始追踪链路，起始节点条件：")
-        # for system, msg_type in root_conditions:
-        #     print(f"  - ({system}, {msg_type})")
-        # print(f"{'='*80}")
         
         start_time = time.time()
         
         # 查找所有符合条件的起始节点，同时记录起始条件
+        print(f"\n开始查找起始节点...")
         root_nodes_list = []
         root_conditions_map = {}  # index -> (系统名, 交易码)
         # print(f"\n每个条件找到的起始节点：")
@@ -108,20 +86,16 @@ class ChainTracer:
                 (self.df['msgType'] == root_msg_type)
             ]
             # print(f"  ({root_system}, {root_msg_type}): {len(nodes)} 个")
-            
             # 记录每个节点的起始条件
             for node_idx in nodes['index'].values:
                 root_conditions_map[node_idx] = (root_system, root_msg_type)
-            
             root_nodes_list.append(nodes)
-        
         # 合并所有起始节点
         if root_nodes_list:
             root_nodes = pd.concat(root_nodes_list, ignore_index=True)
         else:
             root_nodes = pd.DataFrame()
-        
-        print(f"\n总计: {len(root_nodes)} 个起始节点")
+        print(f"总计: {len(root_nodes)} 个起始节点")
         
         if len(root_nodes) == 0:
             print("警告：没有找到符合条件的起始节点")
@@ -131,17 +105,13 @@ class ChainTracer:
         discarded_count = 0
         
         # 对每个起始节点进行追踪
-        print(f"\n开始追踪...")
+        print(f"\n从起始节点追踪串联...")
         n_roots = len(root_nodes)
         print_interval = max(1, n_roots // 10)  # 每10%显示一次
-        
-        # 使用 values 避免 iterrows()
         root_indices = root_nodes['index'].values
-        
         for idx, root_idx in enumerate(root_indices):
             if (idx + 1) % print_interval == 0 or (idx + 1) == n_roots:
                 print(f"  进度: {idx + 1}/{n_roots} ({(idx + 1)*100//n_roots}%)")
-            
             # 获取该节点的起始条件
             root_condition = root_conditions_map.get(root_idx, ('UNKNOWN', 'UNKNOWN'))
             
@@ -182,6 +152,7 @@ class ChainTracer:
         elapsed = time.time() - start_time
         
         # 合并所有链路 DataFrame
+        start_time = time.time()
         if all_chain_dfs:
             all_chains_df = pd.concat(all_chain_dfs, ignore_index=True)
             n_unique_chains_before = all_chains_df['trace_id'].nunique()
@@ -213,6 +184,7 @@ class ChainTracer:
             all_chains_df = pd.DataFrame()
             n_unique_chains = 0
             filtered_count = 0
+        print(f"合并所有链路耗时{time.time() - start_time:.2f}秒")
         
         # 统计信息
         total_paths = n_unique_chains + discarded_count + (filtered_count if all_chain_dfs else 0)
@@ -233,7 +205,7 @@ class ChainTracer:
         print(f"  - 被抛弃: {stats['被抛弃的路径']}")
         print(f"  - 过滤（global_id>1种）: {stats['过滤的链路（global_id>1种）']}")
         print(f"  - 抛弃率: {stats['抛弃率']}")
-        print(f"  - 耗时: {stats['耗时']}")
+        print(f"  - 追踪串联耗时: {stats['耗时']}")
         
         return all_chains_df, stats
     
@@ -424,7 +396,7 @@ class ChainTracer:
 
         return component_nodes
 
-    def find_all_bidirectional_chains(
+    def find_chains_bidirectional(
             self,
             root_conditions: List[Tuple[str, str]] = None,
             max_depth: int = 100
@@ -567,7 +539,7 @@ class ChainTracer:
         print(f"  - 被抛弃: {stats['被抛弃的路径']}")
         print(f"  - 过滤（global_id>1种）: {stats['过滤的链路（global_id>1种）']}")
         print(f"  - 抛弃率: {stats['抛弃率']}")
-        print(f"  - 耗时: {stats['耗时']}")
+        print(f"  - 追踪串联耗时: {stats['耗时']}")
 
         return all_chains_df, stats
     
@@ -749,11 +721,11 @@ class ChainTracer:
 def trace_and_analyze(
     df: pd.DataFrame,
     root_conditions,  # 可以是 List[Tuple[str, str]] 或单个 (str, str)
-    use_filtered: str = 'msg',
     max_depth: int = 100,
     output_prefix: str = None,
     merge_with_input: bool = False,
-    discard_mode: str = 'chain'
+    discard_mode: str = 'chain',
+    trace_direction: str = 'backward'
 ) -> Tuple[pd.DataFrame, Dict, pd.DataFrame]:
     """
     一键追踪和分析链路
@@ -761,13 +733,15 @@ def trace_and_analyze(
     参数:
         df: 包含候选节点列的 DataFrame
         root_conditions: 起始节点条件: [('系统名1', '交易码1'), ('系统名2', '交易码2'), ...]
-        use_filtered: 使用哪个过滤列 ('original', 'gid', 'msg')
         max_depth: 最大深度
         output_prefix: 输出文件前缀（可选）
         merge_with_input: 是否将结果与输入 df 合并，保留所有原始数据（默认 False）
         discard_mode: 抛弃模式
             - 'branch': 只抛弃该节点及其后续路径（默认，原规则）
             - 'chain': 抛弃整条链路（包括之前的链路）
+        trace_direction: 追踪方向
+            - 'backward': 向后追踪串联（默认）
+            - 'bidirectional': 双向追踪串联
     
     返回:
         (chains_df, stats, graph_stats_df)
@@ -787,60 +761,61 @@ def trace_and_analyze(
         trace_and_analyze(df, root_conditions, discard_mode='chain')
     """
     # 创建追踪器
-    tracer = ChainTracer(df, use_filtered=use_filtered, discard_mode=discard_mode)
-    
+    start_time = time.time()
+    tracer = ChainTracer(df, discard_mode=discard_mode)
     # 追踪链路，返回 DataFrame
-    # chains_df, stats = tracer.find_chains_from_root(
-    #     root_conditions=root_conditions,
-    #     max_depth=max_depth
-    # )
-    chains_df, stats = tracer.find_all_bidirectional_chains(root_conditions, max_depth)
-    
+    if trace_direction == 'backward':
+        chains_df, stats = tracer.find_chains_backward(root_conditions, max_depth)
+    elif trace_direction == 'bidirectional':
+        chains_df, stats = tracer.find_chains_bidirectional(root_conditions, max_depth)
+    else:
+        raise ValueError(f"Invalid trace_direction: {trace_direction}")
     if chains_df.empty:
         print("\n没有找到有效链路")
         return pd.DataFrame(), stats, pd.DataFrame()
+    print(f"追踪串联耗时：{time.time() - start_time:.2f} 秒")
     
     # 统计图结构
+    start_time = time.time()
     graph_stats_df = tracer.count_graph_structures(chains_df)
+    print(f"统计图结构耗时：{time.time() - start_time:.2f} 秒")
     
-    # 检查：除起始点外，候选父节点_gid_esb过滤 的值的长度是否有大于1的情况
-    # 由于串联时使用的是候选父节点_gid_esb过滤/候选子节点_gid_esb过滤，
-    # 这里也改为基于该列做一致性检查。
-    if '候选父节点_gid_esb过滤' in chains_df.columns and 'depth' in chains_df.columns:
+    # 检查：除起始点外，候选父节点_gid_msg过滤 的值的长度是否有大于1的情况
+    if '候选父节点_gid_msg过滤' in chains_df.columns and 'depth' in chains_df.columns:
         non_root_nodes = chains_df[chains_df['depth'] > 1]
         if not non_root_nodes.empty:
             multi_parent_count = non_root_nodes[
-                non_root_nodes['候选父节点_gid_esb过滤'].apply(lambda x: len(x) > 1)
+                non_root_nodes['候选父节点_gid_msg过滤'].apply(lambda x: len(x) > 1)
             ]
             if not multi_parent_count.empty:
-                print(f"\n⚠️ 警告：发现 {len(multi_parent_count)} 个非起始节点有多个候选父节点（gid+ESB过滤后）")
+                print(f"\n⚠️ 警告：发现 {len(multi_parent_count)} 个非起始节点有多个候选父节点（gid+msg过滤后）")
                 print("示例节点：")
-                print(multi_parent_count[['index', 'trace_id', 'depth', 'srcSysname', 'dstSysname', 'msgType', '候选父节点_gid_esb过滤']].head(5))
+                print(multi_parent_count[['index', 'trace_id', 'depth', 'srcSysname', 'dstSysname', 'msgType', '候选父节点_gid_msg过滤']].head(5))
             else:
-                print("\n✓ 检查通过：所有非起始节点的候选父节点_gid_esb过滤数量 ≤ 1")
+                print("\n✓ 检查通过：所有非起始节点的候选父节点_gid_msg过滤数量 ≤ 1")
         else:
             print("\n⚠️ 注意：链路中只有起始节点")
 
-    # 保存结果
-    if output_prefix:
-        # 保存完整的链路数据
-        chain_file = f"{output_prefix}_chains.csv"
-        chains_df.to_csv('result/' + chain_file, index=False, encoding='utf-8-sig')
-        print(f"\n完整链路数据已保存到: {chain_file}")
-        
-        # 保存图结构统计
-        if not graph_stats_df.empty:
-            graph_stats_file = f"{output_prefix}_graph_stats.csv"
-            # 保存时排除复杂字段（节点和边的列表）
-            save_cols = []
-            if 'graph_id' in graph_stats_df.columns:
-                save_cols.append('graph_id')
-            save_cols.extend(['图结构', '链路数量', '节点数', '边数', 'trace_id'])
-            if 'root_conditions' in graph_stats_df.columns:
-                save_cols.append('root_conditions')
-            graph_stats_simple = graph_stats_df[save_cols].copy()
-            graph_stats_simple.to_csv('result/' + graph_stats_file, index=False, encoding='utf-8-sig')
-            print(f"图结构统计已保存到: {graph_stats_file}")
+    # # 保存结果
+    # if output_prefix:
+    #     # 保存完整的链路数据
+    #     chain_file = f"{output_prefix}_chains.csv"
+    #     chains_df.to_csv('result/' + chain_file, index=False, encoding='utf-8-sig')
+    #     print(f"\n完整链路数据已保存到: {chain_file}")
+    #
+    #     # 保存图结构统计
+    #     if not graph_stats_df.empty:
+    #         graph_stats_file = f"{output_prefix}_graph_stats.csv"
+    #         # 保存时排除复杂字段（节点和边的列表）
+    #         save_cols = []
+    #         if 'graph_id' in graph_stats_df.columns:
+    #             save_cols.append('graph_id')
+    #         save_cols.extend(['图结构', '链路数量', '节点数', '边数', 'trace_id'])
+    #         if 'root_conditions' in graph_stats_df.columns:
+    #             save_cols.append('root_conditions')
+    #         graph_stats_simple = graph_stats_df[save_cols].copy()
+    #         graph_stats_simple.to_csv('result/' + graph_stats_file, index=False, encoding='utf-8-sig')
+    #         print(f"图结构统计已保存到: {graph_stats_file}")
 
     # 如果需要与输入合并
     if merge_with_input:
@@ -862,45 +837,3 @@ def trace_and_analyze(
         print(f"其中 {chain_info['index'].nunique()} 行在链路中")
 
     return chains_df, stats, graph_stats_df
-
-
-# 使用示例
-if __name__ == "__main__":
-    import sys
-    sys.path.append('.')
-    from chain_transaction_new import chain_df_heap
-    
-    # 读取数据
-    print("读取数据...")
-    df = pd.read_csv("result/PSISADP_test_1117.csv")
-    df['end_at_ms'] = df['start_at_ms'] + df["latency_msec"]
-    df = df.sort_values(by='start_at_ms').reset_index(drop=True).iloc[:100000]
-    df['index'] = df.index
-    
-    # 执行串联
-    print("执行串联...")
-    result = chain_df_heap(df.copy(), left_ms=0, right_ms=0)
-    
-    # 追踪和分析链路
-    
-    # 从文本文件读取起始条件
-    root_conditions_file = 'root_conditions.txt'
-    print(f"从文件读取起始条件: {root_conditions_file}")
-    
-    root_conditions = []
-    with open(root_conditions_file, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith('#'):  # 跳过空行和注释
-                parts = line.split()
-                if len(parts) >= 2:
-                    root_conditions.append((parts[0], parts[1]))
-    
-    print(f"加载了 {len(root_conditions)} 个起始条件")
-    
-    chains_df, stats, graph_stats_df = trace_and_analyze(
-        df=result,
-        root_conditions=root_conditions,
-        use_filtered='msg',  # 使用 msgType 过滤后的结果
-        output_prefix='chain_analysis'
-    )

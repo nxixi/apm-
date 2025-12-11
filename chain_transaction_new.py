@@ -212,10 +212,8 @@ def _add_filtered_columns(df: pd.DataFrame) -> pd.DataFrame:
     6. 按 ESB/F5 结构 + msgType 规则过滤候选父节点
     
     基本过滤规则：
-    - global_id 过滤：当子节点和父节点的 global_id 都存在且不相同时，剔除
-    - msgType 过滤：如果候选节点多于 1 个，保留 msgType 相同的
-    
-    ESB/F5 额外规则（父子必须同 msgType）：
+    - global_id 过滤：当子节点和父节点的 global_id 都存在且不相同时，剔除    
+    - ESB/F5 规则（父子必须同 msgType）：
     1) 当前数据：srcSysname = ESB-F5, dstSysname = ESB
        某候选父节点：srcSysname = XXX, dstSysname = ESB-F5
     2) 当前数据：srcSysname = ESB,    dstSysname = XXX-F5
@@ -259,11 +257,9 @@ def _add_filtered_columns(df: pd.DataFrame) -> pd.DataFrame:
     parents_filtered_by_gid = []
     children_filtered_by_msg = []
     parents_filtered_by_msg = []
-    children_filtered_by_esb_msg = []
-    parents_filtered_by_esb_msg = []
-    # 交集：同时满足 gid 过滤和 esb_msg 过滤
-    children_filtered_by_gid_esb = []
-    parents_filtered_by_gid_esb = []
+    # 交集：同时满足 gid 过滤和 msg 过滤
+    children_filtered_by_gid_msg = []
+    parents_filtered_by_gid_msg = []
 
     def _esb_requires_same_msg(parent_idx: int, child_idx: int) -> bool:
         """
@@ -329,90 +325,66 @@ def _add_filtered_columns(df: pd.DataFrame) -> pd.DataFrame:
         else:
             parents_gid_filtered = list(parents)
         
-        # === 3. 按 msgType 过滤子节点（仅当多于1个时） ===
-        if has_msg_type and len(children_gid_filtered) > 1 and current_msg is not None and pd.notna(current_msg):
-            same_msg_children = [
-                child_idx for child_idx in children_gid_filtered
-                if child_idx in index_to_msg and index_to_msg[child_idx] == current_msg
-            ]
-            children_msg_filtered = same_msg_children if same_msg_children else children_gid_filtered
-        else:
-            children_msg_filtered = children_gid_filtered
-        
-        # === 4. 按 msgType 过滤父节点（仅当多于1个时） ===
-        if has_msg_type and len(parents_gid_filtered) > 1 and current_msg is not None and pd.notna(current_msg):
-            same_msg_parents = [
-                parent_idx for parent_idx in parents_gid_filtered
-                if parent_idx in index_to_msg and index_to_msg[parent_idx] == current_msg
-            ]
-            parents_msg_filtered = same_msg_parents if same_msg_parents else parents_gid_filtered
-        else:
-            parents_msg_filtered = parents_gid_filtered
-        
-        # === 5. ESB/F5 结构下强制 msgType 一致 - 过滤父节点 ===
+        # === 3. ESB/F5 结构下强制 msgType 一致 - 过滤父节点 ===
         # 注意：这里要求在「候选父节点」基础上进行过滤，而不是在 msg/gid 已过滤结果上再过滤
         if has_msg_type and parents:
-            parents_esb_filtered = []
+            parents_msg_filtered = []
             for parent_idx in parents:
                 # 如果满足 ESB/F5 结构，并且 msgType 不一致，则剔除
                 if _esb_requires_same_msg(parent_idx, current_index):
                     parent_msg = index_to_msg.get(parent_idx, None)
                     if not (pd.isna(parent_msg) or pd.isna(current_msg)) and parent_msg != current_msg:
                         continue
-                parents_esb_filtered.append(parent_idx)
+                parents_msg_filtered.append(parent_idx)
         else:
-            parents_esb_filtered = list(parents)
+            parents_msg_filtered = list(parents)
         
-        # === 6. ESB/F5 结构下强制 msgType 一致 - 过滤子节点 ===
+        # === 4. ESB/F5 结构下强制 msgType 一致 - 过滤子节点 ===
         # 同理，在「候选子节点」基础上进行过滤
         if has_msg_type and children:
-            children_esb_filtered = []
+            children_msg_filtered = []
             for child_idx in children:
                 # 当前行为父节点，child_idx 为子节点
                 if _esb_requires_same_msg(current_index, child_idx):
                     child_msg = index_to_msg.get(child_idx, None)
                     if pd.isna(child_msg) or pd.isna(current_msg) or child_msg != current_msg:
                         continue
-                children_esb_filtered.append(child_idx)
+                children_msg_filtered.append(child_idx)
         else:
-            children_esb_filtered = list(children)
+            children_msg_filtered = list(children)
         
         # 添加到结果列表
         children_filtered_by_gid.append(children_gid_filtered)
         parents_filtered_by_gid.append(parents_gid_filtered)
         children_filtered_by_msg.append(children_msg_filtered)
         parents_filtered_by_msg.append(parents_msg_filtered)
-        children_filtered_by_esb_msg.append(children_esb_filtered)
-        parents_filtered_by_esb_msg.append(parents_esb_filtered)
 
-        # === 7. gid 过滤 & esb_msg 过滤的交集 ===
+        # === 5. gid 过滤 & esb_msg 过滤的交集 ===
         # 转为集合再转回有序列表（保持原 gid 过滤顺序）
-        if children_gid_filtered and children_esb_filtered:
-            esb_set = set(children_esb_filtered)
-            children_gid_esb = [idx for idx in children_gid_filtered if idx in esb_set]
+        if children_gid_filtered and children_msg_filtered:
+            msg_set = set(children_msg_filtered)
+            children_gid_msg = [idx for idx in children_gid_filtered if idx in msg_set]
         else:
-            children_gid_esb = []
+            children_gid_msg = []
 
-        if parents_gid_filtered and parents_esb_filtered:
-            esb_set_p = set(parents_esb_filtered)
-            parents_gid_esb = [idx for idx in parents_gid_filtered if idx in esb_set_p]
+        if parents_gid_filtered and parents_msg_filtered:
+            msg_set_p = set(parents_msg_filtered)
+            parents_gid_msg = [idx for idx in parents_gid_filtered if idx in msg_set_p]
         else:
-            parents_gid_esb = []
+            parents_gid_msg = []
 
-        children_filtered_by_gid_esb.append(children_gid_esb)
-        parents_filtered_by_gid_esb.append(parents_gid_esb)
+        children_filtered_by_gid_msg.append(children_gid_msg)
+        parents_filtered_by_gid_msg.append(parents_gid_msg)
     
     # 添加新列
     df['候选子节点_gid过滤'] = children_filtered_by_gid
     df['候选父节点_gid过滤'] = parents_filtered_by_gid
+    # ESB/F5 结构 + msgType 规则过滤结果
     df['候选子节点_msg过滤'] = children_filtered_by_msg
     df['候选父节点_msg过滤'] = parents_filtered_by_msg
-    # ESB/F5 结构 + msgType 规则过滤结果
-    df['候选子节点_esb_msg过滤'] = children_filtered_by_esb_msg
-    df['候选父节点_esb_msg过滤'] = parents_filtered_by_esb_msg
     # 同时满足 gid 和 esb_msg 两种过滤条件
-    df['候选子节点_gid_esb过滤'] = children_filtered_by_gid_esb
-    df['候选父节点_gid_esb过滤'] = parents_filtered_by_gid_esb
+    df['候选子节点_gid_msg过滤'] = children_filtered_by_gid_msg
+    df['候选父节点_gid_msg过滤'] = parents_filtered_by_gid_msg
     
     return df
 
@@ -454,137 +426,6 @@ def estimate_memory_usage(df: pd.DataFrame) -> dict:
         '预估总计': round(total, 2),
         '峰值内存': round(total * 1.2, 2)  # 留 20% 余量
     }
-
-
-def chain_df_heap(
-    df: pd.DataFrame,
-    left_ms: int = 0,
-    right_ms: int = 0,
-    candidate_method: str = "downstream"   # 可选："heap" 或 "downstream"
-) -> pd.DataFrame:
-    """
-    堆优化版本：基于原 chain_transaction.py 的堆算法改造
-    使用时间排序 + 堆维护活跃父节点，找出所有候选父子节点
-    
-    优势：
-    - 对于时间窗口较小的场景，性能优于标准版本
-    - 自动剪枝过期的父节点，减少不必要的比较
-    
-    适用场景：
-    - left_ms 和 right_ms 较小（< 1000ms）
-    - 数据按时间相对有序
-    """
-    start_time = time.time()
-    
-    # 验证必需列
-    required_cols = [src_ip_col, dst_ip_col, 'start_at_ms', 'end_at_ms', 'index']
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    if missing_cols:
-        raise ValueError(f"DataFrame缺少必需的列: {missing_cols}")
-    
-    if df.empty:
-        df['候选子节点'] = [[] for _ in range(len(df))]
-        df['候选父节点'] = [[] for _ in range(len(df))]
-        return df
-    
-    result_df = df.copy()
-    n = len(result_df)
-    
-    # print("【堆优化模式】使用时间排序 + 堆算法")
-    
-    # 初始化结果
-    children_dict = defaultdict(list)  # {parent_index: [child_indices]}
-    parents_dict = defaultdict(list)   # {child_index: [parent_indices]}
-    
-    # 提取数据
-    start_times = result_df['start_at_ms'].values
-    end_times = result_df['end_at_ms'].values
-    indices_values = result_df['index'].values
-    
-    print("构建索引...")
-    # 按 IP 分组
-    src_groups = result_df.groupby(src_ip_col)
-    dst_groups = result_df.groupby(dst_ip_col)
-    
-    print(f"查找候选节点（方法: {candidate_method}）...")
-    # 对每个 IP 对，使用堆算法找所有候选父子关系
-    for ip in set(src_groups.groups.keys()).intersection(dst_groups.groups.keys()):
-        # 候选父节点：dst_ip == ip
-        parent_indices = dst_groups.groups[ip].values
-        # 候选子节点：src_ip == ip  
-        child_indices = src_groups.groups[ip].values
-        
-        if len(parent_indices) == 0 or len(child_indices) == 0:
-            continue
-        
-        # 根据配置选择算法
-        if candidate_method == "downstream":
-            links = _link_all_candidates_downstream_full(
-                parent_indices, child_indices,
-                start_times, end_times, indices_values,
-                left_ms, right_ms
-            )
-        else:
-            links = _link_all_candidates_heap(
-                parent_indices, child_indices,
-                start_times, end_times, indices_values,
-                left_ms, right_ms
-            )
-        
-        # 存储结果
-        for child_idx, parent_idx in links:
-            children_dict[parent_idx].append(child_idx)
-            parents_dict[child_idx].append(parent_idx)
-    
-    # 转换为列表格式（确保键是 Python 原生类型）
-    children_list = [children_dict.get(int(indices_values[i]), []) for i in range(n)]
-    parents_list = [parents_dict.get(int(indices_values[i]), []) for i in range(n)]
-    
-    result_df['候选子节点'] = children_list
-    result_df['候选父节点'] = parents_list
-    
-    # 添加过滤列
-    print("添加过滤列...")
-    result_df = _add_filtered_columns(result_df)
-    
-    # 统计各过滤列的候选节点数量 > 1 的占比
-    print("\n" + "="*80)
-    print("候选节点数量统计（>1 的占比）")
-    print("="*80)
-    
-    total_rows = len(result_df)
-    if total_rows > 0:
-        # 需要统计的列
-        cols_to_check = [
-            ('候选父节点', '候选父节点'),
-            ('候选子节点', '候选子节点'),
-            ('候选父节点_gid过滤', '候选父节点_gid过滤'),
-            ('候选子节点_gid过滤', '候选子节点_gid过滤'),
-            ('候选父节点_msg过滤', '候选父节点_msg过滤'),
-            ('候选子节点_msg过滤', '候选子节点_msg过滤'),
-            ('候选父节点_esb_msg过滤', '候选父节点_esb_msg过滤'),
-            ('候选子节点_esb_msg过滤', '候选子节点_esb_msg过滤'),
-            ('候选父节点_gid_esb过滤', '候选父节点_gid_esb过滤'),
-            ('候选子节点_gid_esb过滤', '候选子节点_gid_esb过滤'),
-        ]
-        
-        for col_name, col_key in cols_to_check:
-            if col_key in result_df.columns:
-                # 统计该列值（列表）长度 > 1 的行数
-                gt1_count = result_df[col_key].apply(lambda x: len(x) if isinstance(x, list) else 0).gt(1).sum()
-                percentage = (gt1_count / total_rows * 100) if total_rows > 0 else 0
-                print(f"{col_name:25s}: {gt1_count:6d}/{total_rows:6d} ({percentage:6.2f}%)")
-            else:
-                print(f"{col_name:25s}: 列不存在")
-    else:
-        print("数据为空，无法统计")
-    
-    print("="*80 + "\n")
-    
-    total_time = time.time() - start_time
-    print(f"串联完成！共处理 {n} 条记录，总耗时: {total_time:.2f}秒")
-    return result_df
-
 
 def _link_all_candidates_heap(
     parent_indices: np.ndarray,
@@ -656,7 +497,7 @@ def _link_all_candidates_heap(
     return links
 
 
-def _link_all_candidates_downstream_full(
+def _link_all_candidates_base(
     parent_indices: np.ndarray,
     child_indices: np.ndarray,
     start_times: np.ndarray,
@@ -708,14 +549,108 @@ def _link_all_candidates_downstream_full(
     return links
 
 
+def get_candidate_nodes(
+        df: pd.DataFrame,
+        left_ms: int = 0,
+        right_ms: int = 0,
+        candidate_method: str = "base"  # 可选："base" 或 "heap"
+) -> pd.DataFrame:
+
+    # 验证必需列
+    required_cols = [src_ip_col, dst_ip_col, 'start_at_ms', 'end_at_ms', 'index']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"DataFrame缺少必需的列: {missing_cols}")
+
+    if df.empty:
+        df['候选子节点'] = [[] for _ in range(len(df))]
+        df['候选父节点'] = [[] for _ in range(len(df))]
+        return df
+
+    n = len(df)
+
+    # 初始化结果
+    children_dict = defaultdict(list)  # {parent_index: [child_indices]}
+    parents_dict = defaultdict(list)  # {child_index: [parent_indices]}
+
+    # 提取数据
+    start_times = df['start_at_ms'].values
+    end_times = df['end_at_ms'].values
+    indices_values = df['index'].values
+
+    # 按 IP 分组
+    src_groups = df.groupby(src_ip_col)
+    dst_groups = df.groupby(dst_ip_col)
+
+    print(f"查找候选节点（方法: {candidate_method}）...")
+    # 对每个 IP 对，找所有候选父子关系
+    for ip in set(src_groups.groups.keys()).intersection(dst_groups.groups.keys()):
+        # 候选父节点：dst_ip == ip
+        parent_indices = dst_groups.groups[ip].values
+        # 候选子节点：src_ip == ip
+        child_indices = src_groups.groups[ip].values
+
+        if len(parent_indices) == 0 or len(child_indices) == 0:
+            continue
+
+        # 根据配置选择算法
+        if candidate_method == "base":
+            links = _link_all_candidates_base(
+                parent_indices, child_indices,
+                start_times, end_times, indices_values,
+                left_ms, right_ms
+            )
+        else:
+            links = _link_all_candidates_heap(
+                parent_indices, child_indices,
+                start_times, end_times, indices_values,
+                left_ms, right_ms
+            )
+
+        # 存储结果
+        for child_idx, parent_idx in links:
+            children_dict[parent_idx].append(child_idx)
+            parents_dict[child_idx].append(parent_idx)
+
+    # 转换为列表格式（确保键是 Python 原生类型）
+    children_list = [children_dict.get(int(indices_values[i]), []) for i in range(n)]
+    parents_list = [parents_dict.get(int(indices_values[i]), []) for i in range(n)]
+
+    df['候选子节点'] = children_list
+    df['候选父节点'] = parents_list
+
+    # 添加过滤列
+    print("添加过滤列...")
+    df = _add_filtered_columns(df)
+
+    # 统计各过滤列的候选节点数量 > 1 的占比
+    print("\n" + "=" * 80)
+    print("候选节点数量统计（>1 的占比）")
+    print("=" * 80)
+    total_rows = len(df)
+    if total_rows > 0:
+        # 需要统计的列
+        cols_to_check = ['候选父节点', '候选子节点', '候选父节点_gid过滤', '候选子节点_gid过滤', '候选父节点_msg过滤', '候选子节点_msg过滤', 
+                         '候选父节点_gid_msg过滤', '候选子节点_gid_msg过滤']
+        for col_name in cols_to_check:
+            # 统计该列值（列表）长度 > 1 的行数
+            gt1_count = df[col_name].apply(lambda x: len(x) if isinstance(x, list) else 0).gt(1).sum()
+            percentage = (gt1_count / total_rows * 100) if total_rows > 0 else 0
+            print(f"{col_name:25s}: {gt1_count:6d}/{total_rows:6d} ({percentage:6.2f}%)")
+    else:
+        print("数据为空，无法统计")
+    print("=" * 80 + "\n")
+
+    return df
+
+
 def chain_df(
     df: pd.DataFrame,
     left_ms: int = 0,
     right_ms: int = 0,
-    use_filtered='msg',
     output_prefix=None,
     discard_mode='chain',
-    candidate_method: str = "downstream",   # 可选：heap, downstream
+    candidate_method: str = "base",   # 可选：base, heap
 ) -> pd.DataFrame:
     """
     串联链路并追踪
@@ -724,26 +659,26 @@ def chain_df(
         df: 输入 DataFrame
         left_ms: 左偏移时间（毫秒）
         right_ms: 右偏移时间（毫秒）
-        use_filtered: 使用哪个过滤列 ('original', 'gid', 'msg')
         output_prefix: 输出文件前缀（可选）
         discard_mode: 抛弃模式
             - 'branch': 只抛弃该节点及其后续路径（默认，原规则）
             - 'chain': 抛弃整条链路（包括之前的链路）
     """
-    df['end_at_ms'] = df['start_at_ms'] + df["latency_msec"]
-
     # 打上父节点、子节点
-    df_node = chain_df_heap(
+    start_time = time.time()
+    df_node = get_candidate_nodes(
         df,
         left_ms=left_ms,
         right_ms=right_ms,
         candidate_method=candidate_method
     )
+    total_time = time.time() - start_time
+    print(f"候选父子节点查找完成！总耗时: {total_time:.2f}秒")
 
-    # 以重要交易码为起点，串联链路
-    # 从文本文件读取起始条件
+
+    # 从文本文件读取起始条件(重点交易码)
     root_conditions_file = 'root_conditions.txt'
-    print(f"从文件读取起始条件: {root_conditions_file}")
+    print(f"\n从文件读取起始条件: {root_conditions_file}")
     root_conditions = []
     with open(root_conditions_file, 'r', encoding='utf-8') as f:
         for line in f:
@@ -754,10 +689,10 @@ def chain_df(
                     root_conditions.append((parts[0], parts[1]))
     print(f"加载了 {len(root_conditions)} 个起始条件")
 
+    # 以重要交易码为起点，串联链路
     chains_df, stats, graph_stats_df = trace_and_analyze(
         df=df_node,
         root_conditions=root_conditions,
-        use_filtered=use_filtered,  # 使用 msgType 过滤后的结果
         output_prefix=output_prefix,
         discard_mode=discard_mode
     )
