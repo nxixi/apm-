@@ -142,13 +142,17 @@ apm_view AS (
         ON a.dst_ip = w.ip
     LEFT JOIN {CK_DATABASE}.v_dws_esb_f5_ip v
         ON chain_src_ip = v.ip
-    WHERE `sync-flag`='同步' AND {where_clause}
+    WHERE 
+    --`sync-flag`='同步' AND 
+    {where_clause}
     ORDER BY start_at_ms
 )
 """
 
 
 if __name__ == '__main__':
+    # df = pd.read_parquet("/Users/fangwang/apple/PycharmProject/apm串联/data/log-full-link.parquet")
+    tb = query_ck('select * FROM ccdc.apm_full_link_log_local limit 10')
     l = query_ck("select count(*) from ccdc.apm WHERE log_id='cf65c14b4c4045ad9a19249f4fe7a07b' and '`sync-flag`='同步'")
     # df = query_ck("select * from ccdc.link where source='transaction_action' and log_id = '408f5b4e7e7f464bb8a50a39f144407b'")
     # df = query_ck("select * from ccdc.apm where log_id = '408f5b4e7e7f464bb8a50a39f144407b'")

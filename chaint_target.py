@@ -205,6 +205,59 @@ def build_tree_from_chain_data(chain_df: pd.DataFrame, cloud_df: pd.DataFrame) -
     for child_id, parent_id in time_based_links.items():
         if child_id not in child_to_parent:
             child_to_parent[child_id] = parent_id
+    
+    # 【新增】去除间接调用关系：如果存在 a->b, b->c, a->c，则删除 a->c
+    # 使用传递闭包检测间接关系
+    def has_indirect_path(src_id: str, dst_id: str, child_to_parent_map: Dict) -> bool:
+        """
+        检查从 src_id 到 dst_id 是否存在间接路径（通过中间节点）
+        返回 True 表示存在间接路径
+        """
+        # 从 dst_id 开始，沿着父节点向上查找，看是否能通过中间节点到达 src_id
+        visited = set()
+        current = dst_id
+        
+        # 先找到 dst_id 的直接父节点
+        if current not in child_to_parent_map:
+            return False
+        
+        direct_parent = child_to_parent_map[current]
+        if direct_parent == src_id:
+            # dst_id 的直接父节点就是 src_id，不是间接关系
+            return False
+        
+        # 从 dst_id 的直接父节点开始，继续向上查找
+        queue = [direct_parent]
+        visited.add(dst_id)
+        visited.add(direct_parent)
+        
+        while queue:
+            current = queue.pop(0)
+            
+            # 如果找到了 src_id，说明存在间接路径
+            if current == src_id:
+                return True
+            
+            # 继续向上查找
+            if current in child_to_parent_map:
+                parent = child_to_parent_map[current]
+                if parent not in visited:
+                    visited.add(parent)
+                    queue.append(parent)
+        
+        return False
+    
+    # 过滤间接关系
+    filtered_child_to_parent = {}
+    for child_id, parent_id in child_to_parent.items():
+        # 检查是否为间接关系
+        if not has_indirect_path(parent_id, child_id, child_to_parent):
+            filtered_child_to_parent[child_id] = parent_id
+        else:
+            logger.info(f"移除间接调用关系: {parent_id} -> {child_id}")
+    
+    # 使用过滤后的关系
+    child_to_parent = filtered_child_to_parent
 
     # 构建反向映射：父节点 -> 子节点列表
     parent_to_children = defaultdict(list)
@@ -321,6 +374,68 @@ def build_tree_from_chain_data(chain_df: pd.DataFrame, cloud_df: pd.DataFrame) -
     return flat_rows
 
 
+def query_full_link_log_data(log_id: str = None, global_id: str = None, limit: int = 5000) -> pd.DataFrame:
+    """
+    查询全链路日志数据（apm_full_link_log）
+    - 以 log_id/global_id 作为过滤条件
+    - 返回原始字段为主，具体时间字段在甘特图函数中再做毫秒转换
+    """
+    if not log_id and not global_id:
+        return pd.DataFrame()
+
+    where_conditions = []
+    if log_id and str(log_id).strip():
+        log_id_escaped = str(log_id).strip().replace("'", "''")
+        where_conditions.append(f"log_id = '{log_id_escaped}'")
+    if global_id and str(global_id).strip():
+        global_id_escaped = str(global_id).strip().replace("'", "''")
+        where_conditions.append(f"global_id = '{global_id_escaped}'")
+
+    if not where_conditions:
+        return pd.DataFrame()
+
+    where_clause = " AND ".join(where_conditions)
+
+    try:
+        sql = f"""
+        SELECT
+            clusterName,
+            podName,
+            nameSpace,
+            podIp,
+            applicationObjectName,
+            log_timestamp,
+            log_id,
+            span_id,
+            exts_span_id,
+            span_type,
+            depot_id,
+            module_type,
+            send_time,
+            rtn_time,
+            server_name,
+            message_name,
+            response_status,
+            rtn_code,
+            msg_type,
+            msg_id,
+            send_sysname,
+            recv_sysname,
+            request_ip,
+            global_id
+        FROM {CK_DATABASE}.apm_full_link_log
+        WHERE {where_clause}
+        ORDER BY log_timestamp
+        LIMIT {int(limit) if limit else 5000}
+        """
+        df = query_ck(sql)
+        logger.info(f"查询到 {len(df)} 条全链路日志数据")
+        return df
+    except Exception as e:
+        logger.error(f"查询全链路日志数据失败: {e}")
+        return pd.DataFrame()
+
+
 def query_chain_condition_data(log_id: str = None, global_id: str = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     根据 log_id 和/或 global_id 查询云下和云上数据
@@ -360,7 +475,8 @@ def query_chain_condition_data(log_id: str = None, global_id: str = None) -> Tup
         sql_down = f"""
         SELECT *
         FROM {CK_DATABASE}.apm
-        WHERE {where_clause_down} AND `sync-flag`='同步'
+        WHERE {where_clause_down} 
+        --AND `sync-flag`='同步'
         ORDER BY start_at_ms
         """
         df_down = query_ck(sql_down)
@@ -402,7 +518,11 @@ def query_chain_condition_data(log_id: str = None, global_id: str = None) -> Tup
     return df_down, df_up
 
 
-def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> Tuple[go.Figure, List[Dict]]:
+def create_timeline_gantt_chart(
+    df_down: pd.DataFrame,
+    df_up: pd.DataFrame,
+    df_full_link: pd.DataFrame = None,
+) -> Tuple[go.Figure, List[Dict], List[Dict]]:
     """
     创建时间跨度甘特图
     
@@ -411,7 +531,7 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
         df_up: 云上数据
     
     返回:
-        (Plotly Figure 对象, 表格数据列表)
+        (Plotly Figure 对象, 表格数据列表, all_data列表用于拓扑图)
     """
     def truncate_text(text, max_length=50):
         """截断文本，超过长度时显示省略号"""
@@ -425,7 +545,7 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
     
     fig = go.Figure()
     
-    # 收集所有数据，按开始时间排序
+    # 收集所有数据，后续统一通过 sort_timestamp/sort_send_time/sort_rtn_time 排序
     all_data = []
     
     # 处理云下数据
@@ -437,9 +557,11 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
         is_esb = bool(row.get('is_esb', False))
         is_f5 = bool(row.get('is_f5', False))
         
+        start = start_ms
+        end = end_ms
         all_data.append({
-            'start': start_ms,
-            'end': end_ms,
+            'start': start,
+            'end': end,
             'duration': latency,
             'location': '云下',
             'trace_id': row.get('trace_id', ''),
@@ -454,6 +576,11 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
             'start_time': datetime.fromtimestamp(start_ms / 1000).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] if start_ms else '',
             'is_esb': is_esb,
             'is_f5': is_f5,
+            # 排序字段映射
+            'sort_timestamp': start,
+            'sort_send_time': start,
+            'sort_rtn_time': end,
+            'data_source': 'apm',
         })
     
     # 处理云上数据
@@ -483,9 +610,11 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
         response_duration = int(row.get('response_duration', 0))
         end_ms = start_ms + response_duration
         
+        start = start_ms
+        end = end_ms
         all_data.append({
-            'start': start_ms,
-            'end': end_ms,
+            'start': start,
+            'end': end,
             'duration': response_duration,
             'location': '云上',
             'span_id': row.get('span_id', ''),
@@ -502,24 +631,123 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
             'is_f5': False,   # 云上数据没有F5标识
             'src_ip': row.get('src_ip', ''),
             'srcSysName': row.get('srcSysName', ''),
+            'service_status': row.get('service_status', ''),
+            # 排序字段映射
+            'sort_timestamp': start,
+            'sort_send_time': start,
+            'sort_rtn_time': end,
+            'data_source': 'link',
         })
-    
-    # 排序规则：
-    # 1. 先按开始时间排序（最早的在前）
-    # 2. 开始时间相同时，结束时间越晚的越靠前
-    # 3. 如果开始时间相同、结束时间也相同：
-    #    按照“上一条的 chain_dst_key = 下一条的 chain_src_key”的规则排序，
-    #    即使得相邻记录在链路上尽量首尾相接，便于观察调用链
+    # 追加 full_link_log 数据
+    if df_full_link is not None and not df_full_link.empty:
+        def _to_ms(v):
+            if v is None or pd.isna(v):
+                return None
+            if isinstance(v, datetime):
+                return int(v.timestamp() * 1000)
+            if isinstance(v, str):
+                try:
+                    dt = datetime.fromisoformat(v.replace('Z', '+00:00')) if 'T' in v else datetime.strptime(v, "%Y-%m-%d %H:%M:%S")
+                    return int(dt.timestamp() * 1000)
+                except Exception:
+                    return None
+            if isinstance(v, (int, float)):
+                return int(v)
+            return None
+
+        for _, row in df_full_link.iterrows():
+            log_ts_ms = _to_ms(row.get('log_timestamp'))
+            send_ms = _to_ms(row.get('send_time'))
+            rtn_ms = _to_ms(row.get('rtn_time'))
+
+            # 时间段：优先用 send~rtn，否则退化为时间点（使用 log_timestamp）
+            if send_ms is not None and rtn_ms is not None:
+                start_ms = send_ms
+                end_ms = rtn_ms
+            else:
+                start_ms = log_ts_ms
+                end_ms = log_ts_ms
+
+            start = start_ms or 0
+            end = end_ms or start
+
+            module_type = str(row.get('module_type', '') or '').strip().upper()
+
+            all_data.append({
+                'start': start,
+                'end': end,
+                'duration': (end_ms - start_ms) if (start_ms is not None and end_ms is not None) else 0,
+                'location': '全链路',
+                'trace_id': None,
+                'log_id': row.get('log_id', ''),
+                'global_id': row.get('global_id', ''),
+                'msgType': row.get('msg_type', ''),
+                'deployUnitObjectName': row.get('server_name', ''),
+                'chain_src_key': '',
+                'chain_dst_key': '',
+                'src_ip': row.get('request_ip', ''),
+                'srcSysName': row.get('send_sysname', ''),
+                'start_time': datetime.fromtimestamp((log_ts_ms or start) / 1000).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] if (log_ts_ms or start) else '',
+                'is_esb': False,
+                'is_f5': False,
+                'span_id': row.get('span_id', ''),
+                'parent_span_id': row.get('exts_span_id', ''),
+                'source': 'full_link_log',
+                'service_status': row.get('response_status', ''),
+                'module_type': module_type,
+                'log_timestamp': log_ts_ms,
+                'send_time_ms': send_ms,
+                'rtn_time_ms': rtn_ms,
+                # 排序字段
+                'sort_timestamp': log_ts_ms,
+                'sort_send_time': send_ms,
+                'sort_rtn_time': rtn_ms,
+                'data_source': 'full_link_log',
+            })
+
+    # 排序规则（统一三类数据）：
+    # 1) sort_timestamp 升序
+    # 2) sort_send_time 升序（None 排后）
+    # 3) sort_rtn_time 降序（None 排后）
+    # 4) 再叠加原有的链路关系与云上 source 规则
 
     def _compare_gantt_row(a: Dict, b: Dict) -> int:
-        # 1. 开始时间
+        def _cmp_ts(ax, bx, reverse: bool = False) -> int:
+            a_none = ax is None
+            b_none = bx is None
+            if a_none and b_none:
+                return 0
+            if a_none != b_none:
+                # None 排在最后
+                return 1 if a_none else -1
+            if ax == bx:
+                return 0
+            if not reverse:
+                return -1 if ax < bx else 1
+            else:
+                return -1 if ax > bx else 1
+
+        # 1) 统一时间排序
+        c = _cmp_ts(a.get('sort_timestamp'), b.get('sort_timestamp'), reverse=False)
+        if c != 0:
+            return c
+
+        # 2) send_time（None 排后）
+        c = _cmp_ts(a.get('sort_send_time'), b.get('sort_send_time'), reverse=False)
+        if c != 0:
+            return c
+
+        # 3) rtn_time（降序，None 排后）
+        c = _cmp_ts(a.get('sort_rtn_time'), b.get('sort_rtn_time'), reverse=True)
+        if c != 0:
+            return c
+
+        # 4) 保留原有开始/结束时间及链路关系排序逻辑
         if a['start'] != b['start']:
             return -1 if a['start'] < b['start'] else 1
-        # 2. 结束时间（长的在前）
         if a['end'] != b['end']:
             return -1 if a['end'] > b['end'] else 1
 
-        # 3. 开始时间和结束时间都相同时，根据链路关系尝试排序
         a_src = (a.get('chain_src_key') or '').strip()
         a_dst = (a.get('chain_dst_key') or '').strip()
         b_src = (b.get('chain_src_key') or '').strip()
@@ -532,7 +760,18 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
         if b_dst and a_src and b_dst == a_src:
             return 1
 
-        # 否则保持相对顺序（稳定排序会保留原有顺序）
+        # 对于云上数据，如果开始结束时间完全相同，transaction 排在 transaction_action 前面
+        a_location = a.get('location', '')
+        b_location = b.get('location', '')
+        if a_location == '云上' and b_location == '云上':
+            a_source = a.get('source', '')
+            b_source = b.get('source', '')
+            if a_source != 'transaction_action' and b_source == 'transaction_action':
+                return -1
+            if a_source == 'transaction_action' and b_source != 'transaction_action':
+                return 1
+
+        # 否则保持相对顺序
         return 0
 
     all_data.sort(key=cmp_to_key(_compare_gantt_row))
@@ -546,7 +785,7 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
             showarrow=False,
             font=dict(size=16)
         )
-        return fig, []
+        return fig, [], []
     
     # 为每条数据分配 y 轴位置（从上到下，最先发生的在最上方）
     # 使用索引作为唯一标识，正序排列（第一个在顶部）
@@ -587,8 +826,9 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
                     y=[d['_y_pos'], d['_y_pos']],
                     mode='lines+markers',
                     name='云下(F5)',
-                    line=dict(color='#722ed1', width=8),
-                    marker=dict(size=10, color='#722ed1'),
+                    legendgroup='down_f5',
+                    line=dict(color='#722ed1', width=2),
+                    marker=dict(size=4, color='#722ed1'),
                     hovertemplate=hover_text + '<extra></extra>',
                     showlegend=(idx == 0),
                 ))
@@ -617,8 +857,9 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
                     y=[d['_y_pos'], d['_y_pos']],
                     mode='lines+markers',
                     name='云下(ESB实例)',
-                    line=dict(color='#52c41a', width=8),
-                    marker=dict(size=10, color='#52c41a'),
+                    legendgroup='down_esb',
+                    line=dict(color='#52c41a', width=2),
+                    marker=dict(size=4, color='#52c41a'),
                     hovertemplate=hover_text + '<extra></extra>',
                     showlegend=(idx == 0),
                 ))
@@ -647,8 +888,9 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
                     y=[d['_y_pos'], d['_y_pos']],
                     mode='lines+markers',
                     name='云下实例',
-                    line=dict(color='#1890ff', width=8),
-                    marker=dict(size=10, color='#1890ff'),
+                    legendgroup='down_normal',
+                    line=dict(color='#1890ff', width=2),
+                    marker=dict(size=4, color='#1890ff'),
                     hovertemplate=hover_text + '<extra></extra>',
                     showlegend=(idx == 0),
                 ))
@@ -692,7 +934,8 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
                 f"组件: {truncate_text(d.get('deployUnitObjectName', ''), 100)}<br>"
                 f"global_id: {truncate_text(d.get('global_id', ''), 50)}<br>"
                 f"src_ip: {truncate_text(d.get('src_ip', ''), 30)}<br>"
-                f"srcSysName: {truncate_text(d.get('srcSysName', ''), 50)}"
+                f"srcSysName: {truncate_text(d.get('srcSysName', ''), 50)}<br>"
+                f"service_status: {truncate_text(d.get('service_status', ''), 50)}"
             )
             
             fig.add_trace(go.Scatter(
@@ -700,11 +943,164 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
                 y=[d['_y_pos'], d['_y_pos']],
                 mode='lines+markers',
                 name=name,
-                line=dict(color=color, width=8),
-                marker=dict(size=10, color=color),
+                legendgroup='up_' + legend_key,  # 云上数据按类型分组
+                line=dict(color=color, width=2),
+                marker=dict(size=4, color=color),
                 hovertemplate=hover_text + '<extra></extra>',
                 showlegend=show_legend,  # 每种类型的第一条显示图例
             ))
+    
+    # 绘制全链路 full_link_log 数据
+    full_link_data = [d for d in all_data if d.get('data_source') == 'full_link_log']
+    if full_link_data:
+        # 跟踪已显示图例的组
+        shown_legend_groups = set()
+        # CS/CR 一组，SR/SS 一组
+        for idx, d in enumerate(full_link_data):
+            start_ms = d['start']
+            end_ms = d['end']
+            log_ts_ms = d.get('log_timestamp') or d['start']
+            module_type = (d.get('module_type') or '').upper()
+
+            # 颜色与形状：每个 module_type 独立
+            if module_type == 'CS':
+                color = '#ffd700'  # 金色
+                legend_name = '全链路(CS)'
+                legend_group = 'fulllink_cs'
+                marker_symbol = 'triangle-up-open'
+                line_style = 'dash'  # 虚线
+                legend_rank = 10
+            elif module_type == 'CR':
+                color = '#ffd700'  # 金色
+                legend_name = '全链路(CR)'
+                legend_group = 'fulllink_cr'
+                marker_symbol = 'triangle-up'
+                line_style = 'solid'  # 实线
+                legend_rank = 20
+            elif module_type == 'SR':
+                color = '#13c2c2'  # 青色
+                legend_name = '全链路(SR)'
+                legend_group = 'fulllink_sr'
+                marker_symbol = 'square-open'
+                line_style = 'dash'  # 虚线
+                legend_rank = 30
+            else:  # SS
+                color = '#13c2c2'  # 青色
+                legend_name = '全链路(SS)'
+                legend_group = 'fulllink_ss'
+                marker_symbol = 'square'
+                line_style = 'solid'  # 实线
+                legend_rank = 40
+
+            # y 轴位置
+            y_pos = d['_y_pos']
+
+            start_dt = datetime.fromtimestamp(d['start'] / 1000)
+            end_dt = datetime.fromtimestamp(d['end'] / 1000)
+
+            # 格式化悬停信息中的时间
+            send_time_str = datetime.fromtimestamp(d['send_time_ms'] / 1000).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] if d.get('send_time_ms') else '无'
+            rtn_time_str = datetime.fromtimestamp(d['rtn_time_ms'] / 1000).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] if d.get('rtn_time_ms') else '无'
+
+            hover_text = (
+                f"<b>全链路日志</b><br>"
+                f"module_type: {truncate_text(module_type, 10)}<br>"
+                f"log_timestamp: {truncate_text(d.get('start_time', ''), 50)}<br>"
+                f"send_time: {send_time_str}<br>"
+                f"rtn_time: {rtn_time_str}<br>"
+                f"log_id: {truncate_text(d.get('log_id', ''), 60)}<br>"
+                f"global_id: {truncate_text(d.get('global_id', ''), 50)}<br>"
+                f"msgType: {truncate_text(d.get('msgType', ''), 80)}<br>"
+                f"server_name: {truncate_text(d.get('deployUnitObjectName', ''), 100)}<br>"
+                f"request_ip: {truncate_text(d.get('src_ip', ''), 30)}<br>"
+                f"send_sysname: {truncate_text(d.get('srcSysName', ''), 50)}<br>"
+                f"response_status: {truncate_text(d.get('service_status', ''), 50)}"
+            )
+
+            # Check if legend for this group has been shown
+            show_legend_for_group = legend_group not in shown_legend_groups
+            if show_legend_for_group:
+                shown_legend_groups.add(legend_group)
+
+            # 获取 send_time 和 rtn_time
+            send_time_ms = d.get('send_time_ms')
+            rtn_time_ms = d.get('rtn_time_ms')
+            
+            # 判断 send_time 和 rtn_time 的情况
+            has_send = send_time_ms is not None
+            has_rtn = rtn_time_ms is not None
+            
+            # 画线（如果 send_time 和 rtn_time 都有值）
+            if has_send and has_rtn:
+                send_dt = datetime.fromtimestamp(send_time_ms / 1000)
+                rtn_dt = datetime.fromtimestamp(rtn_time_ms / 1000)
+                fig.add_trace(go.Scatter(
+                    x=[send_dt, rtn_dt],
+                    y=[y_pos, y_pos],
+                    mode='lines',
+                    name=legend_name,
+                    legendgroup=legend_group,
+                    line=dict(color=color, width=2),
+                    hovertemplate=hover_text + '<extra></extra>',
+                    showlegend=False,  # 标记的 trace 显示图例，线不显示
+                ))
+            # 如果只有 send_time 有值，在 send_time 位置画一个圆点
+            elif has_send and not has_rtn:
+                send_dt = datetime.fromtimestamp(send_time_ms / 1000)
+                fig.add_trace(go.Scatter(
+                    x=[send_dt],
+                    y=[y_pos],
+                    mode='markers',
+                    name=legend_name,
+                    legendgroup=legend_group,
+                    marker=dict(
+                        size=2,
+                        color=color,
+                        symbol='circle',  # 使用圆点
+                        line=dict(width=2, color=color),
+                    ),
+                    hovertemplate=hover_text + '<extra></extra>',
+                    showlegend=False,  # 不显示图例，log_timestamp 点会显示图例
+                ))
+            # 如果只有 rtn_time 有值，在 rtn_time 位置画一个圆点
+            elif not has_send and has_rtn:
+                rtn_dt = datetime.fromtimestamp(rtn_time_ms / 1000)
+                fig.add_trace(go.Scatter(
+                    x=[rtn_dt],
+                    y=[y_pos],
+                    mode='markers',
+                    name=legend_name,
+                    legendgroup=legend_group,
+                    marker=dict(
+                        size=10,
+                        color=color,
+                        symbol='circle',  # 使用圆点
+                        line=dict(width=2, color=color),
+                    ),
+                    hovertemplate=hover_text + '<extra></extra>',
+                    showlegend=False,  # 不显示图例，log_timestamp 点会显示图例
+                ))
+
+            # 画 timestamp 点（使用 log_timestamp）- 这个 trace 用于显示图例中的标记形状
+            # log_timestamp 点始终显示（用于图例和标记）
+            ts_dt = datetime.fromtimestamp(log_ts_ms / 1000) if log_ts_ms else None
+            if ts_dt:
+                fig.add_trace(go.Scatter(
+                    x=[ts_dt],
+                    y=[y_pos],
+                    mode='markers',
+                    name=legend_name,
+                    legendgroup=legend_group,
+                    marker=dict(
+                        size=10,
+                        color=color,
+                        symbol=marker_symbol,
+                        line=dict(width=2, color=color),
+                    ),
+                    hovertemplate=hover_text + '<extra></extra>',
+                    showlegend=show_legend_for_group,  # 标记的 trace 显示图例，这样图例中会显示标记形状
+                    legendrank=legend_rank,
+                ))
     
     # 计算时间范围，决定显示格式
     if all_data:
@@ -724,6 +1120,7 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
     # 设置布局
     fig.update_layout(
         title='时间跨度甘特图',
+        legend=dict(groupclick='togglegroup'),
         xaxis_title='时间',
         yaxis_title='数据行（按时间顺序，从上到下）',
         barmode='overlay',
@@ -766,7 +1163,570 @@ def create_timeline_gantt_chart(df_down: pd.DataFrame, df_up: pd.DataFrame) -> T
         }
         table_data.append(row)
     
-    return fig, table_data
+    return fig, table_data, all_data
+
+
+def build_mermaid_topology(all_data: List[Dict], show_f5: bool = True) -> Tuple[str, Dict, List[Dict]]:
+    """
+    根据时间包含关系构建 mermaid 拓扑图
+    
+    参数:
+        all_data: 甘特图数据列表
+        show_f5: 是否显示 F5 节点
+    
+    返回:
+        (mermaid 文本, 节点数据字典, 边数据列表)
+    """
+    import json
+    
+    if not all_data:
+        return "graph TD; A[暂无数据]", {}, []
+    
+    # 过滤 F5 数据（如果需要）
+    if not show_f5:
+        all_data = [d for d in all_data if not d.get('is_f5', False)]
+    
+    # 每个数据行对应一个节点（不聚合）
+    node_data = {}  # node_id -> 节点详细信息
+    data_to_node_id = {}  # 数据索引 -> node_id 的映射
+    
+    for idx, data in enumerate(all_data):
+        node_id = f"N_{idx}"
+        data_to_node_id[idx] = node_id
+        
+        deploy_unit_raw = data.get('deployUnitObjectName', '')
+        if deploy_unit_raw is None or (hasattr(pd, 'isna') and pd.isna(deploy_unit_raw)):
+            deploy_unit = ''
+        else:
+            deploy_unit = str(deploy_unit_raw).strip()
+        if not deploy_unit or deploy_unit == 'nan':
+            deploy_unit = '未知组件'
+        
+        # 确定节点颜色
+        location = data.get('location', '')
+        is_esb = data.get('is_esb', False)
+        is_f5 = data.get('is_f5', False)
+        source = data.get('source', '')
+        
+        if location == '云下':
+            if is_f5:
+                node_color = '#722ed1'  # 紫色
+                node_type = '云下(F5)'
+            elif is_esb:
+                node_color = '#52c41a'  # 绿色
+                node_type = '云下(ESB)'
+            else:
+                node_color = '#1890ff'  # 蓝色
+                node_type = '云下'
+        else:  # 云上
+            if source == 'transaction_action':
+                node_color = '#ff7f0e'  # 橙色
+                node_type = '云上(transaction_action)'
+            else:
+                node_color = '#ff0000'  # 红色
+                node_type = '云上(transaction)'
+        
+        # 每个节点只包含一条记录
+        node_data[node_id] = {
+            'label': deploy_unit,
+            'color': node_color,
+            'node_type': node_type,
+            'location': location,
+            'all_records': [data]  # 只包含当前数据行
+        }
+    
+    # 构建边：简单逻辑 - 甘特图从上到下，检查两两数据之间是否有时间包含关系
+    # 如果有包含关系，就在拓扑图中加入调用边
+    edges = []  # [(src_node_id, dst_node_id)]
+    edge_data_list = []  # 边数据列表，用于 tooltip
+    edge_set = set()  # 用于去重
+    
+    # 辅助函数：检查节点 i 是否包含节点 j
+    def contains(i_idx, j_idx):
+        """检查节点 i 的时间范围是否包含节点 j"""
+        data_i = all_data[i_idx]
+        data_j = all_data[j_idx]
+        start_i = data_i.get('start', 0)
+        end_i = data_i.get('end', 0)
+        start_j = data_j.get('start', 0)
+        end_j = data_j.get('end', 0)
+        
+        if start_i <= 0 or end_i <= 0 or end_i <= start_i:
+            return False
+        if start_j <= 0 or end_j <= 0 or end_j <= start_j:
+            return False
+        
+        # i 包含 j：i 的开始时间 <= j 的开始时间 且 i 的结束时间 >= j 的结束时间
+        return start_i <= start_j and end_i >= end_j
+    
+    # 辅助函数：检查两个节点之间是否满足调用关系条件
+    def check_call_relation(src_idx, dst_idx):
+        """
+        检查 src -> dst 是否满足调用关系条件
+        返回 True 表示满足条件
+        """
+        src_data = all_data[src_idx]
+        dst_data = all_data[dst_idx]
+        src_location = src_data.get('location', '')
+        dst_location = dst_data.get('location', '')
+        
+        # 如果父节点和子节点都是云下数据，需要检查 chain_dst_key 和 chain_src_key 是否匹配
+        if src_location == '云下' and dst_location == '云下':
+            src_chain_dst_key = str(src_data.get('chain_dst_key', '') or '').strip()
+            dst_chain_src_key = str(dst_data.get('chain_src_key', '') or '').strip()
+            
+            # 如果 chain_dst_key 或 chain_src_key 为空，不满足条件
+            if not src_chain_dst_key or not dst_chain_src_key:
+                return False
+            
+            # 检查是否匹配
+            return src_chain_dst_key == dst_chain_src_key
+        
+        # 如果是云下->云上，需要检查：msgType相同 且 云下组件以ESB开头
+        elif src_location == '云下' and dst_location == '云上':
+            src_msg_type = str(src_data.get('msgType', '') or '').strip()
+            dst_msg_type = str(dst_data.get('msgType', '') or '').strip()
+            src_deploy_unit_raw = src_data.get('deployUnitObjectName', '')
+            if src_deploy_unit_raw is None or (hasattr(pd, 'isna') and pd.isna(src_deploy_unit_raw)):
+                src_deploy_unit = ''
+            else:
+                src_deploy_unit = str(src_deploy_unit_raw).strip()
+            
+            # 检查 msgType 是否相同
+            if not src_msg_type or not dst_msg_type or src_msg_type != dst_msg_type:
+                return False
+            
+            # 检查云下组件是否以 ESB 开头
+            if not src_deploy_unit.startswith('ESB'):
+                return False
+            
+            return True
+        
+        else:
+            # 其他情况（云上->云下、云上->云上），只需要时间包含关系即可
+            return True
+    
+    # 第一步：收集所有可能的边（满足时间包含关系和调用条件）
+    potential_edges = []  # [(src_idx, dst_idx, src_node_id, dst_node_id)]
+    
+    for i, data_i in enumerate(all_data):
+        node_i_id = data_to_node_id.get(i)
+        if not node_i_id:
+            continue
+        
+        for j, data_j in enumerate(all_data):
+            if i == j:
+                continue
+            
+            node_j_id = data_to_node_id.get(j)
+            if not node_j_id:
+                continue
+            
+            # 检查 i 是否包含 j
+            i_contains_j = contains(i, j)
+            # 检查 j 是否包含 i
+            j_contains_i = contains(j, i)
+            
+            # 确定边的方向
+            if i_contains_j and not j_contains_i:
+                # i 包含 j，且 j 不包含 i：i -> j
+                src_idx, dst_idx = i, j
+                src_node_id, dst_node_id = node_i_id, node_j_id
+            elif j_contains_i and not i_contains_j:
+                # j 包含 i，且 i 不包含 j：j -> i
+                src_idx, dst_idx = j, i
+                src_node_id, dst_node_id = node_j_id, node_i_id
+            elif i_contains_j and j_contains_i:
+                # 互为包含关系（时间完全相同）：按照甘特图顺序，上面的（索引小的）指向下面的（索引大的）
+                if i < j:
+                    src_idx, dst_idx = i, j
+                    src_node_id, dst_node_id = node_i_id, node_j_id
+                else:
+                    continue  # 已经处理过了（i > j 的情况会在 j 的循环中处理）
+            else:
+                # 没有包含关系，跳过
+                continue
+            
+            # 检查是否满足调用关系条件
+            if not check_call_relation(src_idx, dst_idx):
+                continue
+            
+            # 添加到候选边列表
+            potential_edges.append((src_idx, dst_idx, src_node_id, dst_node_id))
+    
+    # 第二步：过滤间接调用关系
+    # 对于涉及云上数据的边（云下->云上、云上->云下、云上->云上），检查是否存在间接路径
+    direct_edges = []
+    
+    for src_idx, dst_idx, src_node_id, dst_node_id in potential_edges:
+        src_data = all_data[src_idx]
+        dst_data = all_data[dst_idx]
+        src_location = src_data.get('location', '')
+        dst_location = dst_data.get('location', '')
+        
+        # 如果是纯云下调用（云下->云下），不需要检查间接关系（已经通过 chain_key 保证了直接关系）
+        if src_location == '云下' and dst_location == '云下':
+            direct_edges.append((src_idx, dst_idx, src_node_id, dst_node_id))
+            continue
+        
+        # 如果涉及云上数据，需要检查是否存在间接路径
+        # 检查是否存在中间节点 k，使得 src->k->dst（间接关系）
+        is_direct = True
+        # for k, data_k in enumerate(all_data):
+        #     if k == src_idx or k == dst_idx:
+        #         continue
+        #
+        #     # 检查 src 是否包含 k（时间包含关系），且 k 是否包含 dst（时间包含关系）
+        #     src_contains_k = contains(src_idx, k)
+        #     k_contains_dst = contains(k, dst_idx)
+        #
+        #     if not (src_contains_k and k_contains_dst):
+        #         continue  # src 不包含 k 或 k 不包含 dst，不是中间节点
+        #
+        #     # 检查 src->k 和 k->dst 是否都满足调用关系条件
+        #     src_to_k_ok = check_call_relation(src_idx, k)
+        #     k_to_dst_ok = check_call_relation(k, dst_idx)
+        #
+        #     # 如果 src->k 和 k->dst 都满足条件，那么 src->dst 是间接关系
+        #     if src_to_k_ok and k_to_dst_ok:
+        #         is_direct = False
+        #         logger.info(f"移除间接调用关系: {src_data.get('deployUnitObjectName', '')} -> {dst_data.get('deployUnitObjectName', '')} (通过 {data_k.get('deployUnitObjectName', '')})")
+        #         break
+        #
+        # 如果是直接关系，添加到结果列表
+        if is_direct:
+            direct_edges.append((src_idx, dst_idx, src_node_id, dst_node_id))
+    
+    # 第三步：构建最终的边和边数据
+    for src_idx, dst_idx, src_node_id, dst_node_id in direct_edges:
+        if (src_node_id, dst_node_id) not in edge_set:
+            edges.append((src_node_id, dst_node_id))
+            edge_set.add((src_node_id, dst_node_id))
+            
+            # 构建边数据
+            src_data = all_data[src_idx]
+            dst_data = all_data[dst_idx]
+            deploy_unit_src_raw = src_data.get('deployUnitObjectName', '')
+            if deploy_unit_src_raw is None or (hasattr(pd, 'isna') and pd.isna(deploy_unit_src_raw)):
+                deploy_unit_src = '' or '未知组件'
+            else:
+                deploy_unit_src = str(deploy_unit_src_raw).strip() or '未知组件'
+            deploy_unit_dst_raw = dst_data.get('deployUnitObjectName', '')
+            if deploy_unit_dst_raw is None or (hasattr(pd, 'isna') and pd.isna(deploy_unit_dst_raw)):
+                deploy_unit_dst = '' or '未知组件'
+            else:
+                deploy_unit_dst = str(deploy_unit_dst_raw).strip() or '未知组件'
+            
+            edge_data = {
+                'edge_id': len(edge_data_list),
+                'src': deploy_unit_src,
+                'dst': deploy_unit_dst,
+                'msgType': dst_data.get('msgType', ''),
+                'start_at_ms': dst_data.get('start', 0),
+                'end_at_ms': dst_data.get('end', 0),
+                'duration': dst_data.get('duration', 0),
+                'location': dst_data.get('location', ''),
+            }
+            edge_data_list.append(edge_data)
+    
+    # 构建 mermaid 文本
+    # 根据节点数量决定布局方向：节点多时使用 TB（上下），少时使用 LR（左右）
+    node_count = len(node_data)
+    if node_count > 8:
+        layout_direction = "TB"  # 上下布局，适合节点多的情况
+    else:
+        layout_direction = "LR"  # 左右布局，适合节点少的情况
+    lines = [f"flowchart {layout_direction}"]
+    
+    # 收集所有唯一的颜色，为每种颜色定义一个样式类
+    color_to_class = {}
+    class_counter = 0
+    for node_id, data in node_data.items():
+        color = data['color']
+        if color not in color_to_class:
+            class_name = f"colorClass{class_counter}"
+            color_to_class[color] = class_name
+            class_counter += 1
+    
+    # 定义节点样式类（在节点定义之前）
+    for color, class_name in color_to_class.items():
+        lines.append(f"    classDef {class_name} fill:{color},stroke:#334155,stroke-width:2px,color:#fff")
+    
+    # 添加节点定义
+    for node_id, data in node_data.items():
+        label = data['label']
+        # 转义特殊字符，处理中文字符
+        label_escaped = label.replace('"', '&quot;').replace("'", "&#39;")
+        lines.append(f"    {node_id}[\"{label_escaped}\"]")
+        # 应用样式
+        color = data['color']
+        class_name = color_to_class[color]
+        lines.append(f"    class {node_id} {class_name}")
+    
+    # 添加边
+    for src_id, dst_id in edges:
+        lines.append(f"    {src_id} --> {dst_id}")
+    
+    mermaid_text = "\n".join(lines) + "\n"
+    
+    return mermaid_text, node_data, edge_data_list
+
+
+def build_html_doc_topology(mermaid_text: str, node_data: Dict, edge_data_list: List[Dict], title: str = "拓扑图") -> str:
+    """
+    构建包含 tooltip 的 HTML 文档
+    
+    参数:
+        mermaid_text: Mermaid 图文本
+        node_data: 节点数据字典
+        edge_data_list: 边数据列表
+        title: 标题
+    
+    返回:
+        HTML 文档字符串
+    """
+    import json
+    
+    # 将节点数据转换为 JSON（用于 tooltip）
+    # 注意：需要处理 JSON 中的特殊字符，特别是不能直接序列化 datetime 等对象
+    # 先清理数据，确保可以 JSON 序列化
+    clean_node_data = {}
+    for node_id, data in node_data.items():
+        clean_node_data[node_id] = {
+            'label': data.get('label', ''),
+            'color': data.get('color', ''),
+            'node_type': data.get('node_type', ''),
+            'location': data.get('location', ''),
+            'all_records': []
+        }
+        # 清理记录数据，只保留可序列化的字段
+        for record in data.get('all_records', []):
+            clean_record = {}
+            for key, value in record.items():
+                # 跳过以 _ 开头的内部字段
+                if key.startswith('_'):
+                    continue
+                # 转换值为字符串或基本类型
+                if value is None:
+                    clean_record[key] = None
+                elif isinstance(value, (str, int, float, bool)):
+                    clean_record[key] = value
+                else:
+                    clean_record[key] = str(value)
+            clean_node_data[node_id]['all_records'].append(clean_record)
+    
+    tooltip_json_nodes = json.dumps(clean_node_data, ensure_ascii=False)
+    tooltip_json_edges = json.dumps(edge_data_list, ensure_ascii=False)
+    
+    return f"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{title}</title>
+    <style>
+        body {{
+            margin: 0;
+            background: #f5f7fa;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+        }}
+        .container {{
+            padding: 16px;
+            width: 100%;
+            box-sizing: border-box;
+        }}
+        .card {{
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            box-shadow: 0 6px 24px rgba(15,23,42,0.08);
+            padding: 16px;
+            position: relative;
+            overflow: visible;
+            width: 100%;
+        }}
+        .title {{
+            text-align: center;
+            font-weight: 700;
+            font-size: 18px;
+            margin: 4px 0 12px;
+            color: #0f172a;
+            letter-spacing: .2px;
+        }}
+        .mermaid {{
+            background: transparent;
+            width: 100%;
+            height: 100%;
+            min-height: 500px;
+        }}
+        .mermaid svg {{
+            color: #0f172a;
+            width: 100%;
+            height: auto;
+            max-width: 100%;
+        }}
+        .node-tooltip {{
+            position: absolute;
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 12px 16px;
+            border-radius: 8px;
+            font-size: 14px;
+            pointer-events: none;
+            z-index: 1000;
+            display: none;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            max-width: 400px;
+            line-height: 1.6;
+        }}
+        .tooltip-row {{
+            margin: 4px 0;
+        }}
+        .tooltip-label {{
+            color: #94a3b8;
+            font-weight: 600;
+            margin-right: 8px;
+        }}
+        .tooltip-value {{
+            color: #e2e8f0;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <div class="title">{title}</div>
+            <div class="mermaid">{mermaid_text}</div>
+        </div>
+    </div>
+    <div id="tooltip" class="node-tooltip"></div>
+    <script src="/assets/mermaid.min.js"></script>
+    <script>
+        const nodeData = {tooltip_json_nodes};
+        const edgeData = {tooltip_json_edges};
+        
+        mermaid.initialize({{
+            startOnLoad: true,
+            theme: 'default',
+            securityLevel: 'loose',
+            flowchart: {{
+                curve: 'basis',
+                rankSpacing: 100,
+                nodeSpacing: 60,
+                useMaxWidth: true,
+                htmlLabels: true
+            }}
+        }});
+        
+        // 等待 Mermaid 渲染完成后添加 tooltip 事件
+        setTimeout(() => {{
+            const tooltip = document.getElementById('tooltip');
+            
+            // 提取节点 ID 的辅助函数
+            const extractNodeId = (rawId) => {{
+                const m = String(rawId).match(/(N_\\d+)/);
+                return m ? m[1] : String(rawId);
+            }};
+            
+            // 节点 tooltip
+            document.querySelectorAll('.node').forEach(node => {{
+                const nid = extractNodeId(node.id);
+                const data = nodeData[nid];
+                
+                if (data) {{
+                    node.style.cursor = 'pointer';
+                    
+                    node.addEventListener('mouseenter', (e) => {{
+                        // 构建 tooltip 内容
+                        const records = data.all_records || [];
+                        let tooltipHTML = '<div class="tooltip-row"><span class="tooltip-label">组件:</span><span class="tooltip-value">' + data.label + '</span></div>';
+                        tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">类型:</span><span class="tooltip-value">' + data.node_type + '</span></div>';
+                        tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">位置:</span><span class="tooltip-value">' + data.location + '</span></div>';
+                        tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">记录数:</span><span class="tooltip-value">' + records.length + '</span></div>';
+                        
+                        // 显示第一条记录的详细信息（与甘特图相同）
+                        if (records.length > 0) {{
+                            const first = records[0];
+                            tooltipHTML += '<div class="tooltip-row" style="margin-top: 8px; border-top: 1px solid #334155; padding-top: 8px;"><span class="tooltip-label">详细信息:</span></div>';
+                            
+                            // 云下数据字段
+                            if (first.trace_id) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">trace_id:</span><span class="tooltip-value">' + (first.trace_id || '') + '</span></div>';
+                            
+                            // 云上数据字段
+                            if (first.span_id) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">span_id:</span><span class="tooltip-value">' + (first.span_id || '') + '</span></div>';
+                            if (first.parent_span_id) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">parent_span_id:</span><span class="tooltip-value">' + (first.parent_span_id || '') + '</span></div>';
+                            if (first.source) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">source:</span><span class="tooltip-value">' + (first.source || '') + '</span></div>';
+                            
+                            // 通用字段
+                            if (first.log_id) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">log_id:</span><span class="tooltip-value">' + (first.log_id || '') + '</span></div>';
+                            if (first.global_id) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">global_id:</span><span class="tooltip-value">' + (first.global_id || '') + '</span></div>';
+                            if (first.msgType) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">msgType:</span><span class="tooltip-value">' + (first.msgType || '') + '</span></div>';
+                            if (first.start_time) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">开始时间:</span><span class="tooltip-value">' + (first.start_time || '') + '</span></div>';
+                            if (first.duration !== undefined) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">持续时间:</span><span class="tooltip-value">' + first.duration + 'ms</span></div>';
+                            
+                            // 云下特有字段
+                            if (first.chain_src_key) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">chain_src_key:</span><span class="tooltip-value">' + (first.chain_src_key || '') + '</span></div>';
+                            if (first.chain_dst_key) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">chain_dst_key:</span><span class="tooltip-value">' + (first.chain_dst_key || '') + '</span></div>';
+                            
+                            // 其他字段
+                            if (first.src_ip) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">src_ip:</span><span class="tooltip-value">' + (first.src_ip || '') + '</span></div>';
+                            if (first.srcSysName) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">srcSysName:</span><span class="tooltip-value">' + (first.srcSysName || '') + '</span></div>';
+                            if (first.service_status) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">service_status:</span><span class="tooltip-value">' + (first.service_status || '') + '</span></div>';
+                        }}
+                        
+                        tooltip.innerHTML = tooltipHTML;
+                        tooltip.style.display = 'block';
+                    }});
+                    
+                    node.addEventListener('mousemove', (e) => {{
+                        tooltip.style.left = (e.pageX + 15) + 'px';
+                        tooltip.style.top = (e.pageY + 15) + 'px';
+                    }});
+                    
+                    node.addEventListener('mouseleave', () => {{
+                        tooltip.style.display = 'none';
+                    }});
+                }}
+            }});
+            
+            // 边 tooltip
+            document.querySelectorAll('.edgeLabel').forEach((el) => {{
+                const labelText = el.textContent.trim();
+                // 尝试从边标签中提取信息，或者通过位置匹配
+                // 这里简化处理，可以根据实际需求优化
+                
+                el.style.cursor = 'pointer';
+                
+                el.addEventListener('mouseenter', (e) => {{
+                    // 显示边的信息（如果有）
+                    if (edgeData && edgeData.length > 0) {{
+                        // 简化：显示第一条边数据
+                        const edge = edgeData[0];
+                        let tooltipHTML = '<div class="tooltip-row"><span class="tooltip-label">源:</span><span class="tooltip-value">' + (edge.src || '') + '</span></div>';
+                        tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">目标:</span><span class="tooltip-value">' + (edge.dst || '') + '</span></div>';
+                        if (edge.msgType) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">msgType:</span><span class="tooltip-value">' + edge.msgType + '</span></div>';
+                        if (edge.duration !== undefined) tooltipHTML += '<div class="tooltip-row"><span class="tooltip-label">持续时间:</span><span class="tooltip-value">' + edge.duration + 'ms</span></div>';
+                        
+                        tooltip.innerHTML = tooltipHTML;
+                        tooltip.style.display = 'block';
+                    }}
+                }});
+                
+                el.addEventListener('mousemove', (e) => {{
+                    tooltip.style.left = (e.pageX + 15) + 'px';
+                    tooltip.style.top = (e.pageY + 15) + 'px';
+                }});
+                
+                el.addEventListener('mouseleave', () => {{
+                    tooltip.style.display = 'none';
+                }});
+            }});
+        }}, 800);
+    </script>
+</body>
+</html>
+"""
 
 
 def build_layout():
@@ -1158,6 +2118,39 @@ def build_layout():
                                         "overflowY": "auto",
                                     },
                                 ),
+                                html.Div(
+                                    fac.AntdSpace(
+                                        [
+                                            fac.AntdText("显示F5节点", strong=True, style={"fontSize": 14}),
+                                            fac.AntdSwitch(
+                                                id="show-f5-switch",
+                                                checked=True,
+                                                checkedChildren="显示",
+                                                unCheckedChildren="隐藏",
+                                            ),
+                                        ],
+                                        size=6,
+                                        style={"width": "100%", "marginTop": 16},
+                                    ),
+                                ),
+                                html.Div(
+                                    html.Iframe(
+                                        id="log-id-topology-frame",
+                                        style={
+                                            "width": "100%",
+                                            "height": "800px",
+                                            "minHeight": "600px",
+                                            "border": "1px solid #e5e7eb",
+                                            "borderRadius": "6px",
+                                            "marginTop": 16,
+                                            "display": "block",
+                                        }
+                                    ),
+                                    style={
+                                        "width": "100%",
+                                        "overflow": "hidden",
+                                    }
+                                ),
                             ],
                             title=fac.AntdText("串联条件时间跨度查询", strong=True, style={"fontSize": 16}),
                             style={
@@ -1187,6 +2180,13 @@ app.layout = build_layout()
 # 缓存数据
 cached = {
     "down_df": pd.DataFrame(),  # 云下查询结果
+}
+
+# 缓存查询结果，用于开关切换时更新拓扑图
+cached_query_result = {
+    "all_data": [],
+    "log_id": None,
+    "global_id": None,
 }
 
 
@@ -1426,16 +2426,26 @@ def on_chain(selected_row_keys, table_data, chain_direction, data_scope):
 @app.callback(
     Output("log-id-timeline-chart", "figure"),
     Output("log-id-timeline-table", "data"),
+    Output("log-id-topology-frame", "srcDoc"),
     Output("btn-query-log-id", "loading"),
     Input("btn-query-log-id", "nClicks"),
     State("log-id-input", "value"),
     State("global-id-input", "value"),
+    State("show-f5-switch", "checked"),
     prevent_initial_call=True,
 )
-def on_query_log_id(n_clicks, log_id, global_id):
+def on_query_log_id(n_clicks, log_id, global_id, show_f5):
     """查询串联条件（log_id 和/或 global_id）的时间跨度"""
     if n_clicks is None:
-        return go.Figure(), [], False
+        empty_html = """
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>拓扑图</title></head>
+<body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#999;">
+    <div>请先查询数据</div>
+</body>
+</html>
+"""
+        return go.Figure(), [], empty_html, False
     
     # 检查至少输入一个条件
     log_id_trimmed = log_id.strip() if log_id and log_id.strip() else None
@@ -1451,7 +2461,15 @@ def on_query_log_id(n_clicks, log_id, global_id):
             showarrow=False,
             font=dict(size=16)
         )
-        return empty_fig, [], False
+        empty_html = """
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>拓扑图</title></head>
+<body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#999;">
+    <div>请输入 log_id 或 global_id</div>
+</body>
+</html>
+"""
+        return empty_fig, [], empty_html, False
     
     # 构建查询条件描述
     conditions = []
@@ -1465,13 +2483,90 @@ def on_query_log_id(n_clicks, log_id, global_id):
     # 查询数据
     t1 = time.time()
     df_down, df_up = query_chain_condition_data(log_id=log_id_trimmed, global_id=global_id_trimmed)
+    # 查询全链路日志数据
+    df_full_link = query_full_link_log_data(log_id=log_id_trimmed, global_id=global_id_trimmed)
     t2 = time.time()
-    logger.info(f"查询完成，耗时 {round(t2 - t1, 2)} 秒")
+    logger.info(f"查询完成，耗时 {round(t2 - t1, 2)} 秒（包含全链路日志）")
     
-    # 创建图表和表格数据
-    fig, table_data = create_timeline_gantt_chart(df_down, df_up)
+    # 创建图表和表格数据（包含 full_link）
+    fig, table_data, all_data = create_timeline_gantt_chart(df_down, df_up, df_full_link=df_full_link)
     
-    return fig, table_data, False
+    # 缓存查询结果
+    cached_query_result["all_data"] = all_data
+    cached_query_result["log_id"] = log_id_trimmed
+    cached_query_result["global_id"] = global_id_trimmed
+    
+    # 构建拓扑图
+    if all_data:
+        try:
+            mermaid_text, node_data, edge_data_list = build_mermaid_topology(all_data, show_f5=show_f5)
+            title = f"拓扑图 - {condition_str}"
+            topology_html = build_html_doc_topology(mermaid_text, node_data, edge_data_list, title)
+        except Exception as e:
+            logger.error(f"构建拓扑图失败: {e}")
+            topology_html = f"""
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>拓扑图</title></head>
+<body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#999;">
+    <div>构建拓扑图失败: {str(e)}</div>
+</body>
+</html>
+"""
+    else:
+        topology_html = """
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>拓扑图</title></head>
+<body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#999;">
+    <div>暂无数据</div>
+</body>
+</html>
+"""
+    
+    return fig, table_data, topology_html, False
+
+
+@app.callback(
+    Output("log-id-topology-frame", "srcDoc", allow_duplicate=True),
+    Input("show-f5-switch", "checked"),
+    prevent_initial_call=True,
+)
+def on_toggle_f5(show_f5):
+    """切换 F5 显示时更新拓扑图"""
+    all_data = cached_query_result.get("all_data", [])
+    log_id = cached_query_result.get("log_id")
+    global_id = cached_query_result.get("global_id")
+    
+    if not all_data:
+        return """
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>拓扑图</title></head>
+<body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#999;">
+    <div>请先查询数据</div>
+</body>
+</html>
+"""
+    
+    try:
+        mermaid_text, node_data, edge_data_list = build_mermaid_topology(all_data, show_f5=show_f5)
+        conditions = []
+        if log_id:
+            conditions.append(f"log_id={log_id}")
+        if global_id:
+            conditions.append(f"global_id={global_id}")
+        condition_str = " AND ".join(conditions) if conditions else "拓扑图"
+        title = f"拓扑图 - {condition_str}"
+        topology_html = build_html_doc_topology(mermaid_text, node_data, edge_data_list, title)
+        return topology_html
+    except Exception as e:
+        logger.error(f"构建拓扑图失败: {e}")
+        return f"""
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>拓扑图</title></head>
+<body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#999;">
+    <div>构建拓扑图失败: {str(e)}</div>
+</body>
+</html>
+"""
 
 
 if __name__ == "__main__":
