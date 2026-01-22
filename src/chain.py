@@ -1,6 +1,6 @@
 import pandas as pd
 from datetime import datetime
-from typing import List
+from typing import List, Tuple
 from .ck_client import query_ck, build_apm_cte, logger, CK_DATABASE
 
 
@@ -16,22 +16,22 @@ def search_apm_data_from_ck(start: str, end: str, msg_type: str = None, limit: i
         start_ts = int(datetime.strptime(start, "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
         end_ts = int(datetime.strptime(end, "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
         where_conditions = [
-            # f"start_at_time >= fromUnixTimestamp64Milli({start_ts})", f"start_at_time <= fromUnixTimestamp64Milli({end_ts+1000})",
+            f"start_at_time >= fromUnixTimestamp64Milli({start_ts})", f"start_at_time <= fromUnixTimestamp64Milli({end_ts+1000})",
                             f"start_at_ms >= {start_ts}", f"start_at_ms <= {end_ts}"]
         if msg_type:
             where_conditions.append(f"msgType like '{msg_type}%'")
         where_clause = " AND ".join(where_conditions)
-        # sql = f"""
-        # {build_apm_cte(where_clause)}
-        # SELECT *
-        # FROM apm_view
-        # """
         sql = f"""
+        {build_apm_cte(where_clause)}
         SELECT *
-        FROM {CK_DATABASE}.apm
-        WHERE {where_clause}
-        ORDER BY start_at_ms
+        FROM apm_view
         """
+        # sql = f"""
+        # SELECT *
+        # FROM {CK_DATABASE}.apm
+        # WHERE {where_clause}
+        # ORDER BY start_at_ms
+        # """
         # 按需限制返回条数，避免全量扫描
         if limit is not None:
             try:
@@ -66,17 +66,17 @@ def find_children_from_ck(parent_start_ms: int, parent_end_ms: int, chain_dst_ke
         AND start_at_ms + latency_msec <= {int(parent_end_ms)}
         AND chain_src_key = '{chain_dst_key_escaped}'
         """
-        # sql = f"""
-        # {build_apm_cte(where_clause)}
-        # SELECT *
-        # FROM apm_view
-        # """
         sql = f"""
+        {build_apm_cte(where_clause)}
         SELECT *
-        FROM {CK_DATABASE}.apm
-        WHERE {where_clause}
-        ORDER BY start_at_ms
+        FROM apm_view
         """
+        # sql = f"""
+        # SELECT *
+        # FROM {CK_DATABASE}.apm
+        # WHERE {where_clause}
+        # ORDER BY start_at_ms
+        # """
         logger.info(f"执行查询: {sql}...")
         df_ck = query_ck(sql)
         return df_ck
@@ -101,17 +101,17 @@ def find_parents_from_ck(child_start_ms: int, child_end_ms: int, chain_src_key: 
         AND start_at_ms + latency_msec >= {int(child_end_ms)}
         AND chain_dst_key = '{chain_src_key_escaped}'
         """
-        # sql = f"""
-        # {build_apm_cte(where_clause)}
-        # SELECT *
-        # FROM apm_view
-        # """
         sql = f"""
+        {build_apm_cte(where_clause)}
         SELECT *
-        FROM {CK_DATABASE}.apm
-        WHERE {where_clause}
-        ORDER BY start_at_ms
+        FROM apm_view
         """
+        # sql = f"""
+        # SELECT *
+        # FROM {CK_DATABASE}.apm
+        # WHERE {where_clause}
+        # ORDER BY start_at_ms
+        # """
         logger.info(f"执行查询: {sql}...")
         df_ck = query_ck(sql)
         return df_ck
@@ -277,16 +277,16 @@ def chain_trace_from_selected_row(selected_row: dict, direction: str = "down") -
 def chain_trace_from_selected_data(trace_id: str, direction: str = "down") -> pd.DataFrame:
     # 查询数据
     where_clause = f"where trace_id = {trace_id}"
-    # sql = f"""
-    # {build_apm_cte(where_clause)}
-    # select * from apm_view
-    # """
     sql = f"""
-    SELECT *
-    FROM {CK_DATABASE}.apm
-    WHERE {where_clause}
-    ORDER BY start_at_ms
+    {build_apm_cte(where_clause)}
+    select * from apm_view
     """
+    # sql = f"""
+    # SELECT *
+    # FROM {CK_DATABASE}.apm
+    # WHERE {where_clause}
+    # ORDER BY start_at_ms
+    # """
     logger.info(f"执行查询: {sql}...")
     query_res = query_ck(sql)
     if query_res.empty:
@@ -304,7 +304,7 @@ def chain_trace_from_selected_data(trace_id: str, direction: str = "down") -> pd
 ########################################################################################################################
 
 # 查询log_id符合条件的云上数据
-def search_cloud_data_from_ck(log_ids: List) -> pd.DataFrame:
+def search_cloud_data_from_ck(log_ids: List, start_time: str = '', end_time: str = '') -> pd.DataFrame:
     """
     从 ClickHouse 查询云上数据
     """
@@ -322,6 +322,7 @@ def search_cloud_data_from_ck(log_ids: List) -> pd.DataFrame:
         FROM {CK_DATABASE}.link
         WHERE source = 'transaction_action'
           AND log_id IN ('{log_ids_str}')
+          AND start_at_time >= fromUnixTimestamp64Milli({int(datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S").timestamp() * 1000)}) AND start_at_time < fromUnixTimestamp64Milli({int(datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S").timestamp() * 1000)})
         ORDER BY start_time
         """
         logger.info(f"执行查询: {sql}...")
@@ -367,3 +368,138 @@ def cloud_apm():
     apm_data = query_ck(sql)
 
     # 对full_link_data的每一行，找其子节点
+
+
+########################################################################################################################
+
+# 查询log_id符合条件的云上全链路日志数据
+def query_full_link_log_data(log_id: str = None, global_id: str = None, start_time: str = '', end_time: str = '', limit: int = 5000) -> pd.DataFrame:
+    """
+    查询全链路日志数据（apm_full_link_log）
+    - 以 log_id/global_id 作为过滤条件
+    - 返回原始字段为主，具体时间字段在甘特图函数中再做毫秒转换
+    """
+    if not log_id and not global_id:
+        return pd.DataFrame()
+
+    start_ts = int(datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
+    end_ts = int(datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
+    where_conditions = [f"log_timestamp >= fromUnixTimestamp64Milli({start_ts})", f"log_timestamp < fromUnixTimestamp64Milli({end_ts})"]
+
+    if log_id and str(log_id).strip():
+        log_id_escaped = str(log_id).strip().replace("'", "''")
+        where_conditions.append(f"log_id = '{log_id_escaped}'")
+    if global_id and str(global_id).strip():
+        global_id_escaped = str(global_id).strip().replace("'", "''")
+        where_conditions.append(f"global_id = '{global_id_escaped}'")
+
+    if not where_conditions:
+        return pd.DataFrame()
+
+    where_clause = " AND ".join(where_conditions)
+
+    try:
+        sql = f"""
+        SELECT *
+        FROM {CK_DATABASE}.ods_full_link_log
+        WHERE {where_clause}
+        ORDER BY log_timestamp
+        LIMIT {int(limit) if limit else 5000}
+        """
+        df = query_ck(sql)
+        logger.info(f"查询到 {len(df)} 条全链路日志数据")
+        return df
+    except Exception as e:
+        logger.error(f"查询全链路日志数据失败: {e}")
+        return pd.DataFrame()
+
+
+def query_chain_condition_data(log_id: str = None, global_id: str = None, start_time: str = '', end_time: str = '') -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    根据 log_id 和/或 global_id 查询云下和云上数据
+
+    参数:
+        log_id: 要查询的 log_id（可选）
+        global_id: 要查询的 global_id（可选）
+
+    返回:
+        (云下数据DataFrame, 云上数据DataFrame)
+    """
+    if not log_id and not global_id:
+        return pd.DataFrame(), pd.DataFrame()
+
+    start_ts = int(datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
+    end_ts = int(datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
+
+    # 构建查询条件
+    # where_conditions_down = [f"start_at_ms >= {start_ts}", f"start_at_ms < {end_ts}"]
+    where_conditions_down = [f"start_at_time >= fromUnixTimestamp64Milli({start_ts})", f"start_at_time < fromUnixTimestamp64Milli({end_ts})"]
+    where_conditions_up = []
+
+    if log_id and log_id.strip():
+        log_id_escaped = str(log_id).strip().replace("'", "''")
+        where_conditions_down.append(f"log_id = '{log_id_escaped}'")
+        where_conditions_up.append(f"log_id = '{log_id_escaped}'")
+
+    if global_id and global_id.strip():
+        global_id_escaped = str(global_id).strip().replace("'", "''")
+        where_conditions_down.append(f"global_id = '{global_id_escaped}'")
+        where_conditions_up.append(f"global_id = '{global_id_escaped}'")
+
+    if not where_conditions_down:
+        return pd.DataFrame(), pd.DataFrame()
+
+    where_clause_down = " AND ".join(where_conditions_down)
+    where_clause_up = " AND ".join(where_conditions_up)
+
+    # 查询云下数据
+    try:
+        sql_down = f"""
+        {build_apm_cte(where_clause_down)}
+        select * from apm_view
+        """
+        # sql_down = f"""
+        # SELECT *
+        # FROM {CK_DATABASE}.apm
+        # WHERE {where_clause_down}
+        # --AND `sync-flag`='同步'
+        # ORDER BY start_at_ms
+        # """
+        df_down = query_ck(sql_down)
+        logger.info(f"查询到 {len(df_down)} 条云下数据")
+
+        # 添加ESB和F5标识列
+        if not df_down.empty:
+            # w_ip不为空代表目的地是ESB或F5
+            w_ip_col = df_down.get('w_ip')
+            if w_ip_col is None:
+                has_w_ip = pd.Series([False] * len(df_down), index=df_down.index)
+            else:
+                has_w_ip = w_ip_col.notna() & (w_ip_col.astype(str) != '') & (w_ip_col.astype(str) != 'nan')
+
+            deploy_unit = df_down.get('deployUnitObjectName',
+                                      pd.Series([''] * len(df_down), index=df_down.index)).astype(str)
+
+            # deployUnitObjectName以ESB开头的是ESB，其他为F5
+            df_down['is_esb'] = has_w_ip & deploy_unit.str.startswith('ESB', na=False)
+            df_down['is_f5'] = has_w_ip & (~deploy_unit.str.startswith('ESB', na=False))
+    except Exception as e:
+        logger.error(f"查询云下数据失败: {e}")
+        df_down = pd.DataFrame()
+
+    # 查询云上数据
+    try:
+        sql_up = f"""
+        SELECT *
+        FROM {CK_DATABASE}.link
+        WHERE {where_clause_up}
+        -- AND source = 'transaction_action'
+        ORDER BY start_time
+        """
+        df_up = query_ck(sql_up)
+        logger.info(f"查询到 {len(df_up)} 条云上数据")
+    except Exception as e:
+        logger.error(f"查询云上数据失败: {e}")
+        df_up = pd.DataFrame()
+
+    return df_down, df_up
